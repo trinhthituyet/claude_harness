@@ -1,0 +1,40 @@
+# Example LiteLLM proxy config for using a local model with the harness.
+#
+# The Claude Agent SDK has no base-URL option, and the session speaks the Anthropic
+# Messages API. Ollama's native API and vLLM's OpenAI-compatible API are not that
+# wire format, so a gateway has to translate. LiteLLM exposes an Anthropic-shaped
+# /v1/messages endpoint in front of either one.
+#
+#   litellm --config litellm.config.example.yaml --port 4000
+#
+# Then in the Models panel: provider = ollama (or vllm), base URL =
+# http://localhost:4000, model id = one of the model_name values below.
+#
+# Caveat worth repeating: local models are markedly weaker at the strict tool-call
+# formatting Claude Code depends on. Expect degraded agentic behaviour, not parity.
+
+model_list:
+  # --- Ollama ---------------------------------------------------------------
+  - model_name: local-qwen
+    litellm_params:
+      model: ollama_chat/qwen2.5-coder:32b
+      api_base: http://localhost:11434
+
+  - model_name: local-llama
+    litellm_params:
+      model: ollama_chat/llama3.3:70b
+      api_base: http://localhost:11434
+
+  # --- vLLM (OpenAI-compatible server) -------------------------------------
+  - model_name: local-vllm
+    litellm_params:
+      model: openai/Qwen/Qwen2.5-Coder-32B-Instruct
+      api_base: http://localhost:8000/v1
+      api_key: not-needed
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  # Any non-empty value; put the same string in the model config's API key field.
+  master_key: local

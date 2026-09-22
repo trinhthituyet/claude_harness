@@ -39,19 +39,19 @@ Show configured tasks. Each task has:
 - An assigned team — either select an existing team, or define a new one inline (choosing roles, or creating new roles on the fly)
 - A way to trigger execution of the task
 
-## Trigger Mechanism (Claude Code CLI)
+## Trigger Mechanism (Claude Agent SDK)
 
-- Shell out to the `claude` CLI in headless mode (a subprocess per run) rather than running the session in-process via the Claude Agent SDK.
-- Configure the CLI invocation with:
-  - The subprocess working directory set to the task's selected **project path**
-  - The task's prompt, combined with role instructions for each team member in the assigned team (composed into the system prompt flags / custom agent definitions as appropriate)
-  - The selected model config (Anthropic model, or local vLLM/Ollama endpoint if the CLI supports custom base URLs — flag clearly if not natively supported and propose a workaround)
-  - Enabled skills and MCP servers, wired in via the CLI's supported flags and settings
+- Use the Claude Agent SDK (Python) to run the session in-process rather than shelling out to the CLI.
+- Configure the SDK session with:
+  - `cwd` / working directory set to the task's selected **project path**
+  - The task's prompt, combined with role instructions for each team member in the assigned team (composed into the system prompt or prompt as appropriate)
+  - The selected model config (Anthropic model, or local vLLM/Ollama endpoint if the SDK supports custom base URLs — flag clearly if not natively supported and propose a workaround)
+  - Enabled skills and MCP servers, wired in via the SDK's supported configuration mechanism
 - **Permissions / sandboxing:** Restrict the session so it can only write within the selected project path.
-  - Use the CLI's permission configuration (permission rules and modes, and `PreToolUse` hooks) to allow file write/edit tools only when the target path resolves inside the project directory, and deny (or require explicit approval) for anything outside it.
-  - Read access can be scoped similarly if the CLI supports it — call this out explicitly as a design decision.
-  - Treat this as a hard security boundary, not just a UI hint: validate resolved absolute paths on every write-tool call, not just at session start.
-- Stream the CLI's incremental output/events live to the frontend (via WebSocket or Server-Sent Events).
+  - Use the SDK's permission/tool-approval hooks (e.g. a `canUseTool` / permission callback) to allow file write/edit tools only when the target path resolves inside the project directory, and deny (or require explicit approval) for anything outside it.
+  - Read access can be scoped similarly if the SDK supports it — call this out explicitly as a design decision.
+  - Treat this as a hard security boundary, not just a UI hint: validate resolved absolute paths server-side on every write-tool call, not just at session start.
+- Stream the SDK's incremental output/events live to the frontend (via WebSocket or Server-Sent Events).
 - Store task run history (prompt used, project path, output, status, timestamp) in SQLite.
 
 ## Functional Requirements
@@ -65,5 +65,5 @@ Show configured tasks. Each task has:
 
 1. The data model (tables/schema for skills, mcps, models, roles, teams, tasks, task_runs, and their relationships — include `project_path` on tasks)
 2. The FastAPI project structure (routers, models, services)
-3. How the CLI subprocess will be constructed and run from FastAPI (process lifecycle, sync vs async execution model, how the CLI's streaming output is bridged to WebSocket/SSE)
-4. The exact permission-scoping mechanism you'll use to confine writes to the project path — inspect the actual CLI's permission flags, settings schema and hook API first rather than assuming their shape, since this is a security-critical piece
+3. How the Agent SDK session will be constructed and run from FastAPI (sync vs async execution model, how streaming output is bridged to WebSocket/SSE)
+4. The exact permission-scoping mechanism you'll use to confine writes to the project path — inspect the actual Agent SDK's permission/hook API first rather than assuming its shape, since this is a security-critical piece

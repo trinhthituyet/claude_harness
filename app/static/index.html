@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Harness</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <h1 class="brand">Claude&nbsp;Harness</h1>
+    <nav id="nav">
+      <button data-view="skills">Skills</button>
+      <button data-view="mcps">MCPs</button>
+      <button data-view="models">Models</button>
+      <button data-view="roles">Roles</button>
+      <button data-view="teams">Teams</button>
+      <button data-view="tasks">Tasks</button>
+      <button data-view="runs">Runs</button>
+    </nav>
+    <div id="approval-badge" class="approval-badge" hidden></div>
+    <footer id="health" class="health"></footer>
+  </aside>
+  <main id="panel" class="panel" aria-live="polite"></main>
+</div>
+<div id="toast" class="toast" hidden></div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
