@@ -18,8 +18,9 @@ VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
 Then open <http://localhost:8000>. Single local user, no auth.
 
 ```bash
-.venv/bin/python -m pytest              # unit + API tests, no network
-.venv/bin/python scripts/e2e_check.py   # real SDK session; costs a few cents
+.venv/bin/python -m pytest                   # unit + API tests, no network
+.venv/bin/python scripts/e2e_check.py        # real task session; costs a few cents
+.venv/bin/python scripts/e2e_chat_check.py   # real chat session; costs a few cents
 ```
 
 ## Configuration
@@ -33,6 +34,10 @@ Then open <http://localhost:8000>. Single local user, no auth.
 
 ## The panels
 
+0. **Chat** — describe what you want in plain English and the assistant configures it:
+   roles, teams, MCP servers, model configs, tasks, and starting a run. It asks when
+   something is unclear rather than guessing, and every change is confirmed by you before
+   it takes effect. Declining with a reason ("no, call it Reviewer") is how you steer it.
 1. **Skills** — installed skills discovered under `~/.claude/skills`, a suggested list, and
    import from a `.zip`, a `SKILL.md` upload, or pasted markdown.
 2. **MCPs** — stdio / SSE / HTTP servers, a suggested list, a reachability test, and the
@@ -46,6 +51,24 @@ Then open <http://localhost:8000>. Single local user, no auth.
    including roles created on the fly), skills, MCP servers, permission switches, and Run.
 7. **Runs** — live event stream over SSE, approval prompts, the permission audit trail, and
    the resolved session options for every past run.
+
+## How the chat assistant is confined
+
+Different problem from a task run, so a different answer: the assistant is given **no
+built-in tools at all** (`tools=[]`), so it has no Read, Write, Edit or Bash. Its only
+capabilities are the harness's own configuration operations, exposed as in-process MCP
+tools.
+
+- Every mutating tool is confirmed by you before its handler runs. Gating is an allowlist
+  of read-only tools, so a tool added later without being classified is confirmed by
+  default rather than slipping through.
+- The set advertised to the model as read-only and the set the harness lets run
+  unconfirmed are asserted equal by a test, so they cannot drift.
+- A declined call's reason is passed back to the model, which is how you correct it.
+- It cannot delete anything, and it cannot set an API key — `add_model_config` has no key
+  parameter, so you fill those in via the Models panel.
+- A `PreToolUse` hook refuses anything outside its own toolset, using the same fail-closed
+  wrapper as the task gate.
 
 ## How a run is confined
 

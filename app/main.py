@@ -11,7 +11,8 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db import dispose_db, init_db
-from app.routers import fs, mcps, models, people, runs, skills, tasks
+from app.routers import chat, fs, mcps, models, people, runs, skills, tasks
+from app.services.chat import manager as chat_manager
 from app.services.runner import manager
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await chat_manager.shutdown()
         await manager.shutdown()
         await dispose_db()
 
@@ -39,6 +41,7 @@ def create_app() -> FastAPI:
     app.include_router(people.teams_router)
     app.include_router(tasks.router)
     app.include_router(runs.router)
+    app.include_router(chat.router)
     app.include_router(fs.router)
 
     @app.get("/api/health")

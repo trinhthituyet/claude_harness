@@ -12,22 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_session
 from app.models import McpServer
 from app.schemas import McpIn, McpOut
-from app.services import catalog
+from app.services import catalog, crud
 
 router = APIRouter(prefix="/api/mcps", tags=["mcps"])
-
-
-def _apply(row: McpServer, payload: McpIn) -> None:
-    row.name = payload.name
-    row.description = payload.description
-    row.transport = payload.transport
-    row.command = payload.command
-    row.args_json = list(payload.args)
-    row.env_json = dict(payload.env)
-    row.url = payload.url
-    row.headers_json = dict(payload.headers)
-    row.enabled = payload.enabled
-    row.trusted = payload.trusted
 
 
 @router.get("", response_model=list[McpOut])
@@ -47,37 +34,30 @@ async def suggested(session: AsyncSession = Depends(get_session)):
 @router.post("", response_model=McpOut, status_code=201)
 async def create_mcp(payload: McpIn, session: AsyncSession = Depends(get_session)):
     try:
-        payload.check()
+        row = await crud.create_mcp_server(session, payload)
+    except crud.CrudError as exc:
+        raise HTTPException(409 if exc.conflict else 422, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    if (
-        await session.execute(select(McpServer).where(McpServer.name == payload.name))
-    ).scalars().first():
-        raise HTTPException(409, f"an MCP server named {payload.name!r} already exists")
-    row = McpServer(name=payload.name)
-    _apply(row, payload)
-    session.add(row)
+    result = McpOut.of(row)
     await session.commit()
-    return McpOut.of(row)
+    return result
 
 
 @router.put("/{server_id}", response_model=McpOut)
 async def update_mcp(
     server_id: int, payload: McpIn, session: AsyncSession = Depends(get_session)
 ):
-    try:
-        payload.check()
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
     row = await session.get(McpServer, server_id)
     if row is None:
         raise HTTPException(404, "MCP server not found")
-    # An empty env value means "keep the stored secret".
-    merged = {**(row.env_json or {}), **{k: v for k, v in payload.env.items() if v}}
-    _apply(row, payload)
-    row.env_json = merged
+    try:
+        await crud.update_mcp_server(session, row, payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    result = McpOut.of(row)
     await session.commit()
-    return McpOut.of(row)
+    return result
 
 
 @router.delete("/{server_id}", status_code=204)

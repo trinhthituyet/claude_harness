@@ -2,6 +2,7 @@
 
 from app.models.base import Base, TimestampMixin, utcnow
 from app.models.catalog import McpServer, ModelConfig, Skill
+from app.models.chat import ChatMessage, ChatSession
 from app.models.run import PermissionDecision, RunEvent, TaskRun
 from app.models.task import Task, TaskMcpServer, TaskSkill
 from app.models.team import Role, Team, TeamRole
@@ -22,4 +23,6 @@ __all__ = [
     "TaskRun",
     "RunEvent",
     "PermissionDecision",
+    "ChatSession",
+    "ChatMessage",
 ]

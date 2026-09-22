@@ -354,6 +354,34 @@ class ApprovalIn(BaseModel):
     reason: str = ""
 
 
+# ------------------------------------------------------------------------ chat
+
+
+class ChatStartIn(BaseModel):
+    title: str = "New chat"
+    message: str | None = None
+
+
+class ChatMessageIn(BaseModel):
+    text: str = Field(min_length=1)
+
+
+class ChatConfirmIn(BaseModel):
+    approved: bool
+    reason: str = ""
+
+
+class ChatOut(BaseModel):
+    model_config = ORM
+    id: str
+    title: str
+    status: str
+    total_cost_usd: float | None
+    error_text: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
 # ------------------------------------------------------------------------- fs
 
 

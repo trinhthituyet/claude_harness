@@ -34,7 +34,7 @@ from app.security.gate import ApprovalAnswer, Gate
 from app.security.path_guard import Verdict
 from app.security.policy import RunPolicy
 from app.services import options_builder
-from app.services.events import RunEventBus
+from app.services.events import run_event_bus
 from app.services.snapshot import RunSnapshot, build_snapshot
 
 log = logging.getLogger("harness.runner")
@@ -50,7 +50,7 @@ class Run:
     def __init__(self, run_id: str, snapshot: RunSnapshot) -> None:
         self.id = run_id
         self.snapshot = snapshot
-        self.bus = RunEventBus(run_id)
+        self.bus = run_event_bus(run_id)
         self.policy = RunPolicy(
             root=snapshot.root,
             trusted_mcp_servers=snapshot.trusted_servers,

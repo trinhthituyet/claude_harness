@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import ModelConfig
 from app.schemas import MASK, ModelIn, ModelOut
-from app.services import catalog
+from app.services import catalog, crud
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 
@@ -28,37 +28,20 @@ async def anthropic_catalog():
 
 
 async def _clear_other_defaults(session: AsyncSession, keep_id: int | None) -> None:
-    stmt = update(ModelConfig).values(is_default=False)
-    if keep_id is not None:
-        stmt = stmt.where(ModelConfig.id != keep_id)
-    await session.execute(stmt)
+    await crud.clear_default_model(session, keep_id)
 
 
 @router.post("", response_model=ModelOut, status_code=201)
 async def create_model(payload: ModelIn, session: AsyncSession = Depends(get_session)):
     try:
-        payload.check()
+        row = await crud.create_model_config(session, payload)
+    except crud.CrudError as exc:
+        raise HTTPException(409 if exc.conflict else 422, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    if (
-        await session.execute(select(ModelConfig).where(ModelConfig.name == payload.name))
-    ).scalars().first():
-        raise HTTPException(409, f"a model config named {payload.name!r} already exists")
-    row = ModelConfig(
-        name=payload.name,
-        provider=payload.provider,
-        model_id=payload.model_id,
-        base_url=payload.base_url,
-        api_key=payload.api_key,
-        extra_env_json=dict(payload.extra_env),
-        is_default=payload.is_default,
-    )
-    session.add(row)
-    await session.flush()
-    if payload.is_default:
-        await _clear_other_defaults(session, row.id)
+    result = ModelOut.of(row)
     await session.commit()
-    return ModelOut.of(row)
+    return result
 
 
 @router.put("/{model_id}", response_model=ModelOut)

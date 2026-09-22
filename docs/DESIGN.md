@@ -427,6 +427,7 @@ Seven live probes against a throwaway project, writing inside and outside the ro
 | **P5** | **`PreToolUse` hook callback raises `ValueError`**, `allowed_tools=["Write"]`, target inside root | **The write SUCCEEDED.** No denial recorded. A raising hook is **fail-open** |
 | **P6** | **`can_use_tool` raises `ValueError`**, target outside root | **Denied** — *"Tool permission request failed"* — and recorded in `ResultMessage.permission_denials`. A raising callback is **fail-closed** |
 | **P7** | `permission_mode="dontAsk"`, no allow rules, target **inside** root | **Denied.** `dontAsk` denies anything not pre-approved, in-root writes included |
+| **P8** | In-process SDK MCP tools with `tools=[]`, `can_use_tool` denying one of them | `init.tools` contained **only** `mcp__harness__*` — no built-ins at all. The callback fired for every MCP tool call with resolved arguments; the denied tool's handler **never ran**, and the denial appeared in `permission_denials`. `readOnlyHint` did not exempt a tool from the callback. Drives § 5a |
 
 Four conclusions, two of them counter-intuitive:
 
@@ -770,6 +771,104 @@ detail records it.
    reconciliation.
 7. SSE streaming + run history / permission-decision UI.
 8. Skill import, MCP connection test, model test round-trip, suggestion catalogs.
+
+---
+
+## 5a. Chat: configuring the harness by asking for it
+
+A seventh panel. The user describes what they want — "set up a review task for
+~/code/api" — and the assistant does it, asking when something is unclear and
+confirming every change before it lands.
+
+### 5a.1 Mechanism
+
+The assistant is another SDK session, but with a deliberately inverted tool set:
+
+```python
+ClaudeAgentOptions(
+    tools=[],                                     # no built-in tools at all
+    mcp_servers={"harness": chat_tools.build_server()},   # in-process SDK MCP server
+    strict_mcp_config=True,
+    permission_mode="default",
+    setting_sources=[],
+    can_use_tool=self._can_use_tool,              # the confirmation surface
+    hooks={"PreToolUse": [HookMatcher(hooks=[self._pre_tool_use])]},
+    system_prompt=SYSTEM_PROMPT,                  # plain string, not the claude_code preset
+)
+```
+
+`tools=[]` is the load-bearing line: the session has **no** Read, Write, Edit or Bash.
+Its only capabilities are the fifteen tools in `app/services/chat_tools.py`, which wrap
+the harness's own operations. Verified live — the `init` event's tool list contains
+nothing but `mcp__harness__*`.
+
+The tools are defined with the SDK's `@tool` decorator and served over an in-memory
+transport by `create_sdk_mcp_server`, so they run in the harness process with direct
+access to the database. No subprocess, no IPC, no second copy of the validation rules:
+both the REST routers and these tools go through `app/services/crud.py`.
+
+### 5a.2 Confirmation
+
+Measured first (probe P8): `can_use_tool` **is** invoked for in-process MCP tool calls,
+with the resolved arguments; a denial stops the handler from running at all and is
+reported in `permission_denials`. `readOnlyHint` does not exempt a tool from the
+callback, so the harness decides what needs confirming.
+
+```python
+async def _can_use_tool(self, tool_name, tool_input, context):
+    if not chat_tools.is_mutating(tool_name):
+        return PermissionResultAllow()          # browsing config is fluent
+    ...emit confirmation_request, await the user's answer...
+```
+
+Three properties, each with a test:
+
+- **Gating is an allowlist of read-only tools, not a denylist of mutating ones.** A tool
+  added later without being classified is confirmed by default. The first version had
+  this inverted and a test caught it: an unclassified tool in our own namespace would
+  have run unconfirmed.
+- **The read-only allowlist must equal the set advertised as `readOnlyHint`.** A test
+  asserts the two agree, so the model's view of a tool and the harness's gating cannot
+  drift apart.
+- **A declined call's reason is handed back to the model** as the denial message, which
+  makes "no, call it Reviewer instead" an ordinary way to steer it. Confirmed live: the
+  assistant acknowledged the decline and left the database untouched.
+
+A `PreToolUse` hook additionally refuses anything that is not one of our own tools —
+redundant while `tools=[]` holds, and the cheap insurance if that ever changes. It uses
+the same fail-closed wrapper as the task gate (§ 4.4), for the same reason (P5).
+
+### 5a.3 Asking rather than guessing
+
+The system prompt tells the assistant to read state before changing it, to ask when
+something material is unspecified, and to act once it has enough. Verified live: asked
+to "add a role called Foo" with no further detail, it asked what the role should do and
+created nothing; given the detail in the next message, it raised a confirmation.
+
+Two deliberate restrictions on what it can do:
+
+- **No deletion.** Destructive, irreversible, and the panels already offer it behind an
+  explicit confirm. There is a test asserting no delete-shaped tool exists.
+- **No secrets.** The prompt forbids inventing an API key; `add_model_config` takes no
+  key parameter at all, so the assistant physically cannot set one. The user fills keys
+  in via the Models panel.
+
+### 5a.4 Persistence and streaming
+
+`chat_sessions` plus `chat_messages`, where the transcript *is* the event log — one
+table serves both the durable conversation and SSE replay, indexed by the same `seq`
+the `Last-Event-ID` header carries. `app/services/events.py` was generalised into an
+`EventBus` with injected persist/replay so runs and chats share the fan-out logic.
+
+A chat outlives the browser tab, and `ChatManager.attach` revives one that exists only
+in the database, resuming the model's own conversation via `options.resume` and
+continuing the sequence numbers from the stored maximum (a test pins this — reusing a
+sequence number would corrupt replay). If the resume is rejected, it starts fresh and
+says so in the stream rather than failing the chat.
+
+One asymmetry with runs worth knowing: a finished run's SSE stream terminates, but an
+open chat's does not — it stays open waiting for the next turn. That is correct, and it
+is why the live branch is tested at the bus level rather than over HTTP.
 
 ---
 

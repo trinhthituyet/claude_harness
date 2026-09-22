@@ -1,6 +1,7 @@
 // App shell: sidebar navigation, hash routing, pending-approval badge.
 
 import { api, el, toast } from "./lib.js";
+import * as chat from "./views/chat.js";
 import * as skills from "./views/skills.js";
 import * as mcps from "./views/mcps.js";
 import * as models from "./views/models.js";
@@ -9,7 +10,7 @@ import * as teams from "./views/teams.js";
 import * as tasks from "./views/tasks.js";
 import * as runs from "./views/runs.js";
 
-const VIEWS = { skills, mcps, models, roles, teams, tasks, runs };
+const VIEWS = { chat, skills, mcps, models, roles, teams, tasks, runs };
 const panel = document.getElementById("panel");
 const nav = document.getElementById("nav");
 let cleanup = null;
@@ -58,12 +59,23 @@ async function refreshHealth() {
 async function refreshApprovals() {
   const badge = document.getElementById("approval-badge");
   try {
-    const pending = await api("/api/runs/pending-approvals");
-    if (!pending.length) { badge.hidden = true; return; }
+    const [runs_, chats] = await Promise.all([
+      api("/api/runs/pending-approvals"),
+      api("/api/chat/pending-confirmations"),
+    ]);
+    const total = runs_.length + chats.length;
+    if (!total) { badge.hidden = true; return; }
     badge.hidden = false;
-    badge.textContent =
-      `${pending.length} approval${pending.length > 1 ? "s" : ""} waiting — click to open`;
-    badge.onclick = () => { location.hash = `#/runs/${pending[0].run_id}`; };
+    const target = runs_.length
+      ? `#/runs/${runs_[0].run_id}`
+      : `#/chat/${chats[0].chat_id}`;
+    const what = runs_.length && chats.length
+      ? "approvals and confirmations"
+      : runs_.length
+        ? `approval${runs_.length > 1 ? "s" : ""}`
+        : `confirmation${chats.length > 1 ? "s" : ""}`;
+    badge.textContent = `${total} ${what} waiting — click to open`;
+    badge.onclick = () => { location.hash = target; };
   } catch {
     badge.hidden = true;
   }
