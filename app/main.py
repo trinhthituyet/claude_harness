@@ -31,6 +31,20 @@ async def lifespan(app: FastAPI):
         await dispose_db()
 
 
+class NoCacheStaticFiles(StaticFiles):
+    """Serve the frontend without caching.
+
+    This is a local, single-user dev tool whose assets change constantly. A cached
+    app.js means edits appear not to take effect and a hard reload becomes a thing
+    you have to remember — not worth the microseconds saved on localhost.
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Claude Harness", version="0.1.0", lifespan=lifespan)
 
@@ -57,12 +71,15 @@ def create_app() -> FastAPI:
         }
 
     app.mount(
-        "/static", StaticFiles(directory=str(settings.static_dir)), name="static"
+        "/static", NoCacheStaticFiles(directory=str(settings.static_dir)), name="static"
     )
 
     @app.get("/")
     async def index():
-        return FileResponse(settings.static_dir / "index.html")
+        return FileResponse(
+            settings.static_dir / "index.html",
+            headers={"Cache-Control": "no-store, must-revalidate"},
+        )
 
     return app
 

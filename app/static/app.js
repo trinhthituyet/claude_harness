@@ -18,7 +18,7 @@ let cleanup = null;
 function parseHash() {
   const raw = location.hash.replace(/^#\/?/, "");
   const [name, ...rest] = raw.split("/");
-  return { name: VIEWS[name] ? name : "tasks", arg: rest.join("/") || null };
+  return { name: VIEWS[name] ? name : "chat", arg: rest.join("/") || null };
 }
 
 async function render() {
@@ -81,12 +81,24 @@ async function refreshApprovals() {
   }
 }
 
-if (!location.hash) location.hash = "#/tasks";
+// Background pollers. Kept deliberately slow and paused while the tab is hidden:
+// pending work also arrives on the open SSE stream, so this is only a safety net for
+// panels that are not watching one — it should not flood the server log.
+function poll(fn, intervalMs) {
+  const tick = async () => {
+    if (document.visibilityState === "visible") await fn();
+  };
+  tick();
+  setInterval(tick, intervalMs);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") tick();
+  });
+}
+
+if (!location.hash) location.hash = "#/chat";
 render();
-refreshHealth();
-refreshApprovals();
-setInterval(refreshApprovals, 4000);
-setInterval(refreshHealth, 15000);
+poll(refreshHealth, 60000);
+poll(refreshApprovals, 15000);
 
 window.addEventListener("unhandledrejection", (event) => {
   toast(event.reason?.message || String(event.reason), true);

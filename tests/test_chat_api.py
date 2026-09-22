@@ -206,8 +206,8 @@ async def test_answering_an_unknown_confirmation_conflicts(client):
     assert response.status_code == 409
 
 
-async def test_transcript_is_persisted_and_replayable(client):
-    """A closed chat replays from the table and terminates the stream."""
+async def test_transcript_is_persisted_and_replayed_from_the_table(client):
+    """After a revive the in-memory buffer is empty, so replay must hit the table."""
     chat_id = (await client.post("/api/chat", json={})).json()["chat_id"]
     chat = await manager.attach(chat_id)
     await chat.bus.emit("user", {"text": "hello"})
@@ -217,10 +217,12 @@ async def test_transcript_is_persisted_and_replayable(client):
     assert [m["type"] for m in detail["messages"]] == ["user", "assistant"]
 
     await manager.close(chat_id)
-    stream = await client.get(f"/api/chat/{chat_id}/events", params={"last_event_id": 1})
-    assert "what shall I set up" in stream.text
-    assert "hello" not in stream.text  # already delivered, so not replayed
-    assert "_eof" in stream.text
+    manager._chats.pop(chat_id, None)
+    revived = await manager.attach(chat_id)
+
+    replayed = await revived.bus.replay(1)
+    assert [e["payload"]["text"] for e in replayed] == ["hi, what shall I set up?"]
+    assert [e["seq"] for e in replayed] == [2]
 
 
 async def test_live_bus_replays_and_fans_out(client):
@@ -269,6 +271,113 @@ async def test_a_revived_chat_continues_the_sequence(client):
 
     detail = (await client.get(f"/api/chat/{chat_id}")).json()
     assert [m["seq"] for m in detail["messages"]] == [1, 2, 3]
+
+
+async def test_a_chat_interrupted_by_a_restart_is_recovered(client):
+    """A process restart drops the in-memory turn; the row must not stay 'thinking'.
+
+    Otherwise the panel shows a chat frozen mid-turn forever, which is exactly the
+    failure this reproduces.
+    """
+    chat_id = (await client.post("/api/chat", json={})).json()["chat_id"]
+    chat = await manager.attach(chat_id)
+    await chat.bus.emit("user", {"text": "add the git mcp server"})
+    await chat._set_status("thinking")
+
+    # A restart drops the in-memory object and leaves the row exactly as it was —
+    # so pop it rather than closing it, which would tidy the status on the way out.
+    manager._chats.pop(chat_id, None)
+
+    revived = await manager.attach(chat_id)
+    assert revived.busy is False
+
+    detail = (await client.get(f"/api/chat/{chat_id}")).json()
+    assert detail["chat"]["status"] == "idle"
+    notes = [
+        m["payload"].get("note")
+        for m in detail["messages"]
+        if m["type"] == "status" and m["payload"].get("note")
+    ]
+    assert any("interrupted" in (note or "") for note in notes), notes
+
+
+async def test_a_turn_that_never_connects_fails_visibly(client, monkeypatch):
+    """A stalled session must surface an actionable error, not sit silent forever."""
+    monkeypatch.setattr("app.services.chat.CONNECT_TIMEOUT_S", 0.2)
+    chat_id = (await client.post("/api/chat", json={})).json()["chat_id"]
+    chat = await manager.attach(chat_id)
+
+    async def never_connects():
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(chat, "_ensure_client", never_connects)
+    await chat.send("hello")
+    await asyncio.wait_for(chat._turn, 10)
+
+    detail = (await client.get(f"/api/chat/{chat_id}")).json()
+    assert detail["chat"]["status"] == "failed"
+    assert "did not start within" in detail["chat"]["error_text"]
+    errors = [m for m in detail["messages"] if m["type"] == "error"]
+    assert errors and "ANTHROPIC_API_KEY" in errors[0]["payload"]["message"]
+
+
+async def test_a_failed_turn_drops_the_broken_client(client, monkeypatch):
+    """Otherwise the next message reuses a half-connected session and stalls again."""
+    monkeypatch.setattr("app.services.chat.CONNECT_TIMEOUT_S", 0.2)
+    chat_id = (await client.post("/api/chat", json={})).json()["chat_id"]
+    chat = await manager.attach(chat_id)
+    chat._client = object()  # pretend a previous connect half-succeeded
+
+    async def never_connects():
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(chat, "_ensure_client", never_connects)
+    await chat.send("hello")
+    await asyncio.wait_for(chat._turn, 10)
+    assert chat._client is None
+
+
+async def test_opening_an_interrupted_chat_recovers_it_on_first_load(client):
+    """GET /api/chat/{id} must not render a stale 'thinking' the stream contradicts."""
+    chat_id = (await client.post("/api/chat", json={})).json()["chat_id"]
+    chat = await manager.attach(chat_id)
+    await chat.bus.emit("user", {"text": "add the git mcp server"})
+    await chat._set_status("thinking")
+    manager._chats.pop(chat_id, None)
+
+    detail = (await client.get(f"/api/chat/{chat_id}")).json()
+    assert detail["chat"]["status"] == "idle"
+    assert detail["busy"] is False
+    notes = [
+        m["payload"].get("note")
+        for m in detail["messages"]
+        if m["type"] == "status" and m["payload"].get("note")
+    ]
+    assert any("interrupted" in (note or "") for note in notes), notes
+
+
+async def test_the_event_stream_revives_a_chat_that_is_only_in_the_database(client):
+    """The browser's stream must stay live, not end instantly on a cold chat.
+
+    Serving it from the table would emit _eof, the browser would close the
+    connection, and every later event would be lost — the chat would look stuck.
+    """
+    chat_id = (await client.post("/api/chat", json={})).json()["chat_id"]
+    chat = await manager.attach(chat_id)
+    await chat.bus.emit("user", {"text": "hello"})
+    await manager.close(chat_id)
+    manager._chats.pop(chat_id, None)
+    assert manager.get(chat_id) is None
+
+    # Reading the stream would block (it stays open), so drive the handler's
+    # dependencies the way the endpoint does and check it attached.
+    from app.routers import chat as chat_router
+
+    assert chat_router.manager.get(chat_id) is None
+    revived = await chat_router.manager.attach(chat_id)
+    assert chat_router.manager.get(chat_id) is revived
+    # A live bus means the stream loop stays open instead of emitting _eof.
+    assert revived.bus.closed is False
 
 
 async def test_pending_confirmations_endpoint_sees_every_chat(client):

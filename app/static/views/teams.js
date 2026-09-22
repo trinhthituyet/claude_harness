@@ -1,10 +1,10 @@
-import { api, confirmDelete, el, emptyState, field, toast } from "../lib.js";
+import { api, confirmDelete, el, emptyState, field, mount, toast } from "../lib.js";
 
 export async function render(panel, arg) {
   const [teams, roles] = await Promise.all([api("/api/teams"), api("/api/roles")]);
   const editing = arg ? teams.find((t) => String(t.id) === arg) : null;
 
-  panel.replaceChildren(
+  mount(panel,
     el("h2", {}, "Teams"),
     el("p", { class: "sub" },
       "A team is one or more roles. At run time the lead role drives the session and " +

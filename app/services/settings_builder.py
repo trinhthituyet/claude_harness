@@ -20,25 +20,57 @@ from app.services.snapshot import RunSnapshot
 log = logging.getLogger("harness.settings")
 
 
-def resolve_api_key_helper() -> str | None:
-    """Find an ``apiKeyHelper`` to carry into the session, if one is needed.
+USER_SETTINGS = Path.home() / ".claude" / "settings.json"
 
-    Sessions run with ``setting_sources=[]`` for isolation (docs/DESIGN.md 4.5),
-    which also means the user's ``~/.claude/settings.json`` is *not* loaded — so an
-    installation that authenticates through ``apiKeyHelper`` rather than
-    ``ANTHROPIC_API_KEY`` would fail to authenticate. Carrying just that one field
-    into the generated blob keeps isolation without breaking auth.
-    """
+
+def _read_user_settings() -> dict[str, Any]:
+    try:
+        data = json.loads(USER_SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_api_key_helper() -> str | None:
+    """The ``apiKeyHelper`` to carry into a session, if one is configured."""
     override = app_settings.api_key_helper
     if override:
         return override
-    user_settings = Path.home() / ".claude" / "settings.json"
-    try:
-        data = json.loads(user_settings.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    helper = data.get("apiKeyHelper")
+    helper = _read_user_settings().get("apiKeyHelper")
     return helper if isinstance(helper, str) and helper else None
+
+
+def inherited_auth_settings(exclude_env: set[str] | frozenset[str] = frozenset()) -> dict[str, Any]:
+    """Copy the authentication parts of ``~/.claude/settings.json`` — and only those.
+
+    Sessions run with ``setting_sources=[]`` so that a ``.claude/settings.local.json``
+    inside a target project cannot pre-approve tools (docs/DESIGN.md 4.5). That also
+    stops the *user's* settings loading, which is where an installation keeps the
+    credentials that make plain ``claude`` work: ``apiKeyHelper``, and an ``env`` block
+    that can carry required headers, base URLs and certificate paths. Without them a
+    request can be rejected as an invalid key, or hang.
+
+    So we take exactly the auth and environment keys across, and never ``permissions``
+    — inheriting those is what the isolation is there to prevent.
+
+    ``exclude_env`` drops keys the run configures itself, so a task pointed at a local
+    gateway is not silently redirected by an inherited ``ANTHROPIC_BASE_URL``.
+    """
+    data = _read_user_settings()
+    out: dict[str, Any] = {}
+
+    helper = resolve_api_key_helper()
+    if helper:
+        out["apiKeyHelper"] = helper
+
+    env = {
+        key: value
+        for key, value in (data.get("env") or {}).items()
+        if isinstance(value, str) and key not in exclude_env
+    }
+    if env:
+        out["env"] = env
+    return out
 
 
 def build_sandbox(snapshot: RunSnapshot) -> dict[str, Any] | None:
@@ -55,10 +87,13 @@ def build_sandbox(snapshot: RunSnapshot) -> dict[str, Any] | None:
     }
 
 
-def build_settings(policy: RunPolicy, *, needs_api_key_helper: bool = True) -> dict[str, Any]:
+def build_settings(
+    policy: RunPolicy,
+    *,
+    needs_api_key_helper: bool = True,
+    exclude_env: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     blob: dict[str, Any] = {"permissions": {"deny": deny_rules(policy)}}
     if needs_api_key_helper:
-        helper = resolve_api_key_helper()
-        if helper:
-            blob["apiKeyHelper"] = helper
+        blob.update(inherited_auth_settings(exclude_env))
     return blob

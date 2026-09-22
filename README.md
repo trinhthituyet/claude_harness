@@ -28,9 +28,23 @@ Then open <http://localhost:8000>. Single local user, no auth.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `HARNESS_DB` | `data/harness.db` | SQLite file (created `0600`) |
-| `HARNESS_CLI_PATH` | SDK's bundled CLI | Pin a specific `claude` binary |
+| `HARNESS_CLI_PATH` | the `claude` on your PATH | Which CLI sessions run. `bundled` forces the SDK's own copy |
 | `HARNESS_MAX_RUNS` | `3` | Concurrent sessions |
 | `HARNESS_API_KEY_HELPER` | auto-detected | See "Authentication" below |
+
+### If a session hangs instead of answering
+
+```bash
+.venv/bin/python scripts/doctor.py     # run this in the terminal you start uvicorn from
+```
+
+It checks each link in the chain — environment, API key helper, a minimal session, a
+full chat session — with a 60s cap on each, and tells you which one broke.
+
+The usual cause is the CLI. Sessions run the `claude` on your PATH by default, because
+that install already has your authentication, proxy and certificates; the SDK's bundled
+binary has none of that, and when it cannot reach the API it **hangs** rather than
+erroring. `/api/health` reports which binary is in use.
 
 ## The panels
 

@@ -1,4 +1,4 @@
-import { api, checkbox, confirmDelete, el, emptyState, field, toast } from "../lib.js";
+import { api, checkbox, confirmDelete, el, emptyState, field, mount, toast } from "../lib.js";
 
 const LOCAL_NOTE =
   "Local providers need an Anthropic-API-compatible gateway (LiteLLM proxy or " +
@@ -13,7 +13,7 @@ export async function render(panel, arg) {
   ]);
   const editing = arg ? configs.find((c) => String(c.id) === arg) : null;
 
-  panel.replaceChildren(
+  mount(panel,
     el("h2", {}, "Models"),
     el("p", { class: "sub" }, "Which LLM backend a session uses. One config can be the default."),
     el("div", { class: "note" }, LOCAL_NOTE),

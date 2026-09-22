@@ -866,9 +866,23 @@ continuing the sequence numbers from the stored maximum (a test pins this — re
 sequence number would corrupt replay). If the resume is rejected, it starts fresh and
 says so in the stream rather than failing the chat.
 
-One asymmetry with runs worth knowing: a finished run's SSE stream terminates, but an
-open chat's does not — it stays open waiting for the next turn. That is correct, and it
-is why the live branch is tested at the bus level rather than over HTTP.
+**The event endpoint attaches rather than looks up.** An early version served a chat
+that was not in memory from the table and closed the stream with `_eof`. That produced
+a failure observed in the browser: after a `--reload` restart mid-turn, the panel
+reconnected, got nothing, and sat forever on a chat frozen at "thinking". Two fixes,
+each with a test:
+
+* `GET /api/chat/{id}/events` revives the chat, so the stream is always live and `_eof`
+  only means "deleted or shutting down".
+* `attach` treats a row still claiming `thinking` or `awaiting_confirmation` as
+  interrupted: its turn died with the old process and any confirmation it was waiting on
+  is gone. It resets the status and writes a note into the transcript saying so, rather
+  than leaving a chat that will never speak again.
+
+The browser now also shows the connection state, because a silently dead stream is
+indistinguishable from a stuck assistant. One asymmetry with runs remains by design: a
+finished run's stream terminates, an open chat's does not — which is why the live branch
+is tested at the bus level rather than over HTTP.
 
 ---
 

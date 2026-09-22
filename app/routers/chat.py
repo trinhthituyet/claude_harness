@@ -44,15 +44,23 @@ async def start_chat(payload: ChatStartIn):
 
 @router.get("/{chat_id}")
 async def get_chat(chat_id: str, session: AsyncSession = Depends(get_session)):
+    # Attach before reading: a chat whose turn died with a previous process still has
+    # a row claiming it is mid-turn, and attaching is what resets that. Reading first
+    # would render a stale "thinking" that the stream then silently contradicts.
+    try:
+        live = await manager.attach(chat_id)
+    except KeyError as exc:
+        raise HTTPException(404, "chat not found") from exc
+
     row = await session.get(ChatSession, chat_id)
     if row is None:
         raise HTTPException(404, "chat not found")
+    await session.refresh(row)
     messages = (
         await session.execute(
             select(ChatMessage).where(ChatMessage.chat_id == chat_id).order_by(ChatMessage.seq)
         )
     ).scalars().all()
-    live = manager.get(chat_id)
     return {
         "chat": ChatOut.model_validate(row).model_dump(),
         "messages": [
@@ -64,8 +72,8 @@ async def get_chat(chat_id: str, session: AsyncSession = Depends(get_session)):
             }
             for m in messages
         ],
-        "pending_confirmations": live.pending_confirmations() if live else [],
-        "busy": bool(live and live.busy),
+        "pending_confirmations": live.pending_confirmations(),
+        "busy": live.busy,
     }
 
 
@@ -104,35 +112,20 @@ async def stream(
     last_event_id: int = 0,
     session: AsyncSession = Depends(get_session),
 ):
-    """Live transcript. Honours Last-Event-ID so a reload resumes without gaps."""
+    """Live transcript. Honours Last-Event-ID so a reload resumes without gaps.
+
+    The chat is *attached*, not merely looked up: a conversation that exists only in
+    the database (because the process restarted) is revived so the stream stays live.
+    Serving it from the table instead would end the stream immediately, and the
+    browser would sit on a dead connection showing a chat frozen mid-turn.
+    """
     header = request.headers.get("last-event-id")
     after = int(header) if header and header.isdigit() else last_event_id
 
-    if await session.get(ChatSession, chat_id) is None:
-        raise HTTPException(404, "chat not found")
-    chat = manager.get(chat_id)
-
-    if chat is None:
-        async def stored() -> AsyncIterator[str]:
-            rows = (
-                await session.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.chat_id == chat_id, ChatMessage.seq > after)
-                    .order_by(ChatMessage.seq)
-                )
-            ).scalars().all()
-            for row in rows:
-                yield _sse(
-                    {
-                        "seq": row.seq,
-                        "type": row.type,
-                        "ts": row.ts.isoformat() if row.ts else None,
-                        "payload": row.payload_json,
-                    }
-                )
-            yield "event: _eof\ndata: {}\n\n"
-
-        return StreamingResponse(stored(), media_type="text/event-stream")
+    try:
+        chat = await manager.attach(chat_id)
+    except KeyError as exc:
+        raise HTTPException(404, "chat not found") from exc
 
     bus = chat.bus
 

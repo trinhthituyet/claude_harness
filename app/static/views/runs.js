@@ -1,9 +1,9 @@
-import { api, el, emptyState, shortJson, toast, when } from "../lib.js";
+import { api, el, emptyState, mount, shortJson, toast, when } from "../lib.js";
 
 export async function render(panel, arg) {
   if (arg) return renderRun(panel, arg);
   const runs = await api("/api/runs");
-  panel.replaceChildren(
+  mount(panel,
     el("h2", {}, "Runs"),
     el("p", { class: "sub" }, "Every session the harness has started, newest first."),
     runs.length
@@ -52,7 +52,7 @@ async function renderRun(panel, runId) {
   }, "Cancel run");
   cancelButton.hidden = !detail.live;
 
-  panel.replaceChildren(
+  mount(panel,
     el("div", { class: "card-head" },
       el("h2", {}, "Run"), status,
       el("div", { class: "card-actions" },

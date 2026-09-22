@@ -1,4 +1,4 @@
-import { api, confirmDelete, el, emptyState, field, toast } from "../lib.js";
+import { api, confirmDelete, el, emptyState, field, mount, toast } from "../lib.js";
 
 export async function render(panel, arg) {
   const [roles, suggested] = await Promise.all([
@@ -7,7 +7,7 @@ export async function render(panel, arg) {
   ]);
   const editing = arg ? roles.find((r) => String(r.id) === arg) : null;
 
-  panel.replaceChildren(
+  mount(panel,
     el("h2", {}, "Roles"),
     el("p", { class: "sub" },
       "A role is a name, a description and the system prompt that defines its behaviour. " +

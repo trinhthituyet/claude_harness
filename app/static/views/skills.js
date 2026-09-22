@@ -1,4 +1,4 @@
-import { api, confirmDelete, el, emptyState, field, toast } from "../lib.js";
+import { api, confirmDelete, el, emptyState, field, mount, toast } from "../lib.js";
 
 export async function render(panel) {
   const [installed, suggested] = await Promise.all([
@@ -39,7 +39,7 @@ export async function render(panel) {
     el("div", {}, el("button", { class: "btn", type: "submit" }, "Install skill"))
   );
 
-  panel.replaceChildren(
+  mount(panel,
     el("h2", {}, "Skills"),
     el("p", { class: "sub" },
       `Skills are directories with a SKILL.md, discovered under ~/.claude/skills. ` +

@@ -1,4 +1,4 @@
-import { api, confirmDelete, el, emptyState, shortJson, toast, when } from "../lib.js";
+import { api, confirmDelete, el, emptyState, mount, shortJson, toast, when } from "../lib.js";
 
 const EXAMPLES = [
   "Set up a code review task for ~/code/myproject",
@@ -11,7 +11,7 @@ export async function render(panel, arg) {
   if (arg) return renderChat(panel, arg);
 
   const chats = await api("/api/chat");
-  panel.replaceChildren(
+  mount(panel,
     el("h2", {}, "Chat"),
     el("p", { class: "sub" },
       "Describe what you want set up and the assistant does it — creating roles, teams, " +
@@ -104,8 +104,19 @@ async function renderChat(panel, chatId) {
   const transcript = el("div", { class: "stream" },
     detail.messages.map((message) => line(message)));
   const confirmations = el("div", {});
+  const connection = el("div", { class: "note danger" }, "");
+  connection.hidden = true;
   const status = el("span", { class: `tag ${statusClass(detail.chat.status)}` },
     detail.chat.status);
+
+  function setConnection(state, message) {
+    if (state === "open") {
+      connection.hidden = true;
+      return;
+    }
+    connection.hidden = false;
+    connection.textContent = message;
+  }
 
   const input = el("textarea", {
     name: "text",
@@ -137,13 +148,14 @@ async function renderChat(panel, chatId) {
     sendButton,
     el("span", { class: "hint" }, "⌘/Ctrl + Enter to send")));
 
-  panel.replaceChildren(
+  mount(panel,
     el("div", { class: "card-head" },
       el("h2", {}, detail.chat.title), status,
       el("div", { class: "card-actions" },
         el("button", { class: "btn ghost", onclick: () => { location.hash = "#/chat"; } },
           "All chats"))),
     detail.chat.error_text ? el("div", { class: "note danger" }, detail.chat.error_text) : null,
+    connection,
     confirmations,
     transcript,
     form
@@ -209,7 +221,21 @@ async function renderChat(panel, chatId) {
     drawConfirmations([...pending.values()]);
     append(event);
   });
-  source.addEventListener("_eof", () => source.close());
+  source.addEventListener("_eof", () => {
+    source.close();
+    setConnection("closed", "The server closed this stream. Reload to reconnect.");
+  });
+  source.onopen = () => setConnection("open");
+  source.onerror = () => {
+    // EventSource retries on its own unless the connection is CLOSED. Either way the
+    // user should see it: a silently dead stream looks exactly like a stuck chat.
+    setConnection(
+      source.readyState === EventSource.CLOSED ? "closed" : "retrying",
+      source.readyState === EventSource.CLOSED
+        ? "Disconnected from the server. Reload to reconnect."
+        : "Reconnecting…"
+    );
+  };
 
   function handle(message) {
     let event;

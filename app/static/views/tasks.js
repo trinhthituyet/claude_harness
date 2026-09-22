@@ -1,4 +1,4 @@
-import { api, checkbox, confirmDelete, el, emptyState, field, toast } from "../lib.js";
+import { api, checkbox, confirmDelete, el, emptyState, field, mount, toast } from "../lib.js";
 
 export async function render(panel, arg) {
   const [tasks, teams, roles, models, skills, mcps] = await Promise.all([
@@ -11,7 +11,7 @@ export async function render(panel, arg) {
   ]);
   const editing = arg ? tasks.find((t) => String(t.id) === arg) : null;
 
-  panel.replaceChildren(
+  mount(panel,
     el("h2", {}, "Tasks"),
     el("p", { class: "sub" },
       "A task is a prompt, a project directory and a team. Running it starts one Claude " +

@@ -1,4 +1,4 @@
-import { api, checkbox, confirmDelete, el, emptyState, field, toast } from "../lib.js";
+import { api, checkbox, confirmDelete, el, emptyState, field, mount, toast } from "../lib.js";
 
 function parseArgs(text) {
   return text.split("\n").map((line) => line.trim()).filter(Boolean);
@@ -22,7 +22,7 @@ export async function render(panel, arg) {
   ]);
   const editing = arg ? servers.find((s) => String(s.id) === arg) : null;
 
-  panel.replaceChildren(
+  mount(panel,
     el("h2", {}, "MCP servers"),
     el("p", { class: "sub" },
       "Servers selected on a task are passed to the session with strict MCP config, so a " +

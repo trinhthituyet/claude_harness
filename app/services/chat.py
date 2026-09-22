@@ -46,13 +46,19 @@ from app.models import ChatMessage, ChatSession, ModelConfig
 from app.services import chat_tools
 from app.services.events import EventBus, chat_event_bus
 from app.services.model_resolver import resolve, scrubbed_base_env
-from app.services.settings_builder import resolve_api_key_helper
+from app.services.settings_builder import inherited_auth_settings
 from app.services.snapshot import ModelSpec
 
 log = logging.getLogger("harness.chat")
 
 CONFIRM_TIMEOUT_S = 300
 MAX_TURNS_PER_MESSAGE = 25
+#: Starting a session spawns the CLI and authenticates. If that has not happened by
+#: now something is wrong with auth or the endpoint, and silence is the worst answer.
+CONNECT_TIMEOUT_S = 90
+#: Whole-turn ceiling. Must exceed CONFIRM_TIMEOUT_S, since a turn legitimately
+#: blocks while waiting for the user to answer a confirmation.
+TURN_TIMEOUT_S = 900
 
 SYSTEM_PROMPT = """\
 You are the configuration assistant for Claude Harness, a local control panel that
@@ -90,6 +96,15 @@ class ConfirmAnswer:
     reason: str = ""
 
 
+class SessionStartError(RuntimeError):
+    """The CLI session never came up.
+
+    A distinct type rather than TimeoutError: since Python 3.11 ``asyncio.TimeoutError``
+    *is* ``TimeoutError``, so raising that here would be indistinguishable from the
+    whole-turn timeout and the actionable message would be replaced by the generic one.
+    """
+
+
 @dataclass
 class PendingConfirmation:
     id: str
@@ -116,6 +131,7 @@ class Chat:
         self._turn_lock = asyncio.Lock()
         self._known_tools = {chat_tools.qualified(t.name) for t in chat_tools.ALL_TOOLS}
         self._turn: asyncio.Task[None] | None = None
+        self._stderr: list[str] = []
 
     @property
     def busy(self) -> bool:
@@ -212,10 +228,9 @@ class Chat:
             )
         model_id, model_env = resolve(spec)
 
-        blob: dict[str, Any] = {}
-        helper = resolve_api_key_helper()
-        if helper:
-            blob["apiKeyHelper"] = helper
+        # Carry the user's auth settings (never their permissions) into the session,
+        # minus anything the model config sets itself. See settings_builder.
+        blob = inherited_auth_settings(exclude_env=frozenset(model_env))
 
         return ClaudeAgentOptions(
             cwd=str(settings.static_dir.parent.parent),
@@ -223,7 +238,7 @@ class Chat:
             mcp_servers={chat_tools.SERVER_NAME: chat_tools.build_server()},
             strict_mcp_config=True,
             permission_mode="default",
-            setting_sources=[],
+            setting_sources=list(settings.setting_sources or []),
             settings=json.dumps(blob) if blob else None,
             can_use_tool=self._can_use_tool,
             hooks={"PreToolUse": [HookMatcher(hooks=[self._pre_tool_use])]},
@@ -231,7 +246,14 @@ class Chat:
             model=model_id,
             env=scrubbed_base_env() | model_env,
             max_turns=MAX_TURNS_PER_MESSAGE,
+            stderr=self._capture_stderr,
         )
+
+    def _capture_stderr(self, line: str) -> None:
+        """Surface subprocess trouble, which is otherwise invisible from the UI."""
+        self._stderr.append(line)
+        del self._stderr[:-50]
+        log.warning("chat %s stderr: %s", self.id, line.rstrip()[:400])
 
     async def _ensure_client(self) -> ClaudeSDKClient:
         if self._client is not None:
@@ -272,20 +294,57 @@ class Chat:
         async with self._turn_lock:
             await self._set_status("thinking")
             try:
-                client = await self._ensure_client()
-                await client.query(text)
-                async for message in client.receive_response():
-                    await self._handle(message)
+                await asyncio.wait_for(self._turn_body(text), TURN_TIMEOUT_S)
                 await self._set_status("idle")
             except asyncio.CancelledError:
                 await self._set_status("idle")
                 raise
             except Exception as exc:  # noqa: BLE001 - surfaced to the UI
-                log.exception("chat %s turn failed", self.id)
-                await self.bus.emit("error", {"message": f"{type(exc).__name__}: {exc}"})
-                await self._set_status("failed", error=str(exc))
+                await self._fail_turn(exc)
             finally:
                 self.fail_all_pending("turn ended")
+
+    async def _turn_body(self, text: str) -> None:
+        """One turn, with each phase logged so a stall is locatable, not silent."""
+        log.info("chat %s: turn started, connecting session", self.id)
+        try:
+            client = await asyncio.wait_for(self._ensure_client(), CONNECT_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise SessionStartError(
+                f"the Claude Code session did not start within {CONNECT_TIMEOUT_S}s. "
+                "This usually means authentication or the API endpoint: check that "
+                "ANTHROPIC_API_KEY is set in the environment the harness runs in, or "
+                "that the default model config's gateway is reachable."
+            ) from exc
+
+        log.info("chat %s: session connected, sending prompt", self.id)
+        await client.query(text)
+        log.info("chat %s: prompt sent, awaiting the model", self.id)
+
+        first = True
+        async for message in client.receive_response():
+            if first:
+                log.info("chat %s: first response received (%s)", self.id, type(message).__name__)
+                first = False
+            await self._handle(message)
+        log.info("chat %s: turn finished", self.id)
+
+    async def _fail_turn(self, exc: BaseException) -> None:
+        if isinstance(exc, asyncio.TimeoutError):
+            detail = (
+                f"the turn did not finish within {TURN_TIMEOUT_S}s and was abandoned. "
+                "The server log shows which phase it reached."
+            )
+        else:
+            detail = f"{type(exc).__name__}: {exc}"
+        log.exception("chat %s turn failed: %s", self.id, detail)
+        if self._stderr:
+            detail += "\n" + "".join(self._stderr[-5:])
+        # A half-connected client will not recover; drop it so the next message
+        # starts a fresh session rather than reusing a broken one.
+        self._client = None
+        await self.bus.emit("error", {"message": detail})
+        await self._set_status("failed", error=detail)
 
     async def _handle(self, message: Any) -> None:
         if isinstance(message, SystemMessage):
@@ -432,10 +491,18 @@ class ChatManager:
         return chat_id
 
     async def attach(self, chat_id: str) -> Chat:
-        """Return the live chat, reviving one that was only in the database."""
+        """Return the live chat, reviving one that exists only in the database.
+
+        A chat can outlive the process that was running it — a restart (``--reload``
+        in development is the common case) drops every in-memory turn. The row is
+        then left claiming to be mid-turn forever, and any confirmation it was
+        waiting on is gone. Reviving it resets that state and says so in the
+        transcript, rather than leaving the UI watching a chat that will never speak.
+        """
         existing = self._chats.get(chat_id)
         if existing is not None:
             return existing
+        interrupted = False
         async with sessionmaker()() as session:
             row = await session.get(ChatSession, chat_id)
             if row is None:
@@ -445,11 +512,22 @@ class ChatManager:
                     select(func.max(ChatMessage.seq)).where(ChatMessage.chat_id == chat_id)
                 )
             ).scalar() or 0
-            if row.status == "closed":
+            if row.status in {"thinking", "awaiting_confirmation"}:
+                interrupted = True
+            if row.status != "idle":
                 row.status = "idle"
                 await session.commit()
         chat = Chat(chat_id, chat_event_bus(chat_id, start_seq=last_seq))
         self._chats[chat_id] = chat
+        if interrupted:
+            await chat.bus.emit(
+                "status",
+                {
+                    "state": "idle",
+                    "note": "the previous turn was interrupted when the server restarted; "
+                            "send your message again",
+                },
+            )
         return chat
 
     def pending_confirmations(self) -> list[dict[str, Any]]:

@@ -55,7 +55,11 @@ def setting_sources(snapshot: RunSnapshot) -> list[str]:
     Default is none: a ``.claude/settings.local.json`` inside the target project
     could otherwise carry allow rules and pre-approve tools. Skills are only
     discoverable through settings, so a task using skills opts into the user layer.
+    ``HARNESS_SETTING_SOURCES`` overrides both, for installations whose
+    authentication needs the user layer loaded.
     """
+    if app_settings.setting_sources is not None:
+        return list(app_settings.setting_sources)
     if snapshot.trust_project_settings:
         return ["user", "project"]
     if snapshot.skills:
@@ -73,7 +77,9 @@ def build_options(
 ) -> tuple[ClaudeAgentOptions, dict[str, Any]]:
     """Return the options plus the settings blob (for the run record)."""
     model_id, model_env = model_resolver.resolve(snapshot.model)
-    settings_blob = build_settings(policy)
+    # Anything the model config sets must win over the user's inherited settings,
+    # or a task pointed at a local gateway would be redirected back to the default.
+    settings_blob = build_settings(policy, exclude_env=frozenset(model_env))
 
     disallowed = [] if snapshot.network_enabled else list(NETWORK_TOOLS)
 

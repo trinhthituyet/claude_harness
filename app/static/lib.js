@@ -55,6 +55,22 @@ export function emptyState(message) {
   return el("div", { class: "empty" }, message);
 }
 
+/**
+ * Replace a container's children, dropping conditional blanks.
+ *
+ * `node.replaceChildren(null)` renders the literal text "null", so every
+ * `cond ? el(...) : null` in a view needs filtering before it reaches the DOM.
+ */
+export function mount(node, ...children) {
+  node.replaceChildren(
+    ...children
+      .flat()
+      .filter((child) => child !== null && child !== undefined && child !== false)
+      .map((child) => (child instanceof Node ? child : document.createTextNode(String(child))))
+  );
+  return node;
+}
+
 export function field(labelText, control, hint) {
   return el("label", {}, labelText, hint ? el("span", { class: "hint" }, hint) : null, control);
 }
