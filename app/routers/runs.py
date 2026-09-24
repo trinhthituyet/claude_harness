@@ -79,6 +79,7 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)):
         "live": live is not None,
         "pending_approvals": live.pending_approvals() if live else [],
         "team": run.team_snapshot_json,
+        "workflow": run.workflow_snapshot_json,
         "model": run.model_snapshot_json,
         "options": run.options_json,
     }

@@ -886,6 +886,211 @@ is tested at the bus level rather than over HTTP.
 
 ---
 
+## 5b. Workflows: a graph of roles
+
+A team runs as one session with a lead delegating. A **workflow** instead describes the
+order of work explicitly: nodes are roles, edges are transitions, and an edge pointing
+back at an earlier node is a loop. A task runs one or the other.
+
+### 5b.1 Model
+
+```
+workflows          workflow_nodes                  workflow_edges
+─────────          ──────────────                  ──────────────
+id                 id                              id
+name UNIQUE        workflow_id                     workflow_id
+description        key         UNIQUE(workflow,key) from_node_id
+max_steps          role_id     → roles             to_node_id  NULL = END
+                   instructions (this step's brief) label       UNIQUE(from_node,label)
+                   is_start                         condition   "" = unconditional
+                   max_visits   (loop budget)       is_default  fallback, ≤1 per node
+                   position                         position
+```
+
+`tasks.team_id` and `tasks.workflow_id` are both nullable, exactly one set. That made
+`team_id` nullable on an existing database, which SQLite cannot do in place — so
+`app/db.py` gained a small migration: add-missing-columns for every table, plus a
+guarded rebuild of `tasks`. Verified against a hand-built old-schema database with a
+legacy row, which survived.
+
+**`to_node_id IS NULL` means END.** Encoding the terminal state as an edge rather than a
+node flag lets a branch say "if approved, stop" without inventing a sink node, and makes
+"can this graph finish?" a property of its edges.
+
+### 5b.2 Validation, before anything runs
+
+`app/services/graph.py` is pure and unit-tested, and refuses the graphs that would
+misbehave rather than fail loudly:
+
+- no nodes, duplicate keys, `END` as a key, more than one start;
+- an edge to or from an unknown node, repeated labels on one node, two defaults;
+- **a branching node whose edges have no conditions** — the router would have nothing
+  to choose by, so the path would be arbitrary;
+- a node unreachable from the start;
+- **a graph that can never finish** (every reachable node loops with no END edge), where
+  the step budget would be the only exit.
+
+`POST /api/workflows/validate` runs the same checks without saving, which is what the
+editor calls as you type.
+
+### 5b.3 Execution: supersteps
+
+The model is LangGraph's, and `docs/example_graph.py` is why. That graph needs things a
+single-node walk cannot express: `manager_dispatch` fans out to three roles at once,
+`manager_review` runs **once** after all of them, `route_after_review` returns *only the
+flagged roles*, and both loops escalate to a human when capped. So execution is a
+**frontier of active nodes** advanced one superstep at a time:
+
+```
+frontier = {start}
+while frontier:
+    check budgets per node in the frontier
+    run every node in it concurrently          (bounded by MAX_PARALLEL_STEPS)
+    for each result: pick its outgoing edges   (a set, not one)
+    frontier = union of the selected targets   (deduplicated)
+```
+
+**Deduplication is the join.** Architect, designer and tester all point at
+`manager_review`; the union of their successors is `{manager_review}`, so it runs once,
+after all three finish. No join primitive was needed — it falls out of the set union.
+Verified live: three roles in one superstep, `review ran 1x for 1 architect run`.
+
+**A node either fans out or branches.** Several unconditional edges mean every arm is
+taken; conditional edges mean the router chooses. It may choose **several** — that is how
+"only the flagged roles re-run" works. Mixing the two out of one node is rejected, because
+a bare edge alongside described ones is ambiguous: fan-out arm, or undescribed fallback?
+
+**Named artifacts replace the positional digest.** Each node has an `output_key`
+(`arch_doc`, `design_doc`, `code`, …) and a step's prompt lists the artifacts by name, the
+way the example's nodes read `state["arch_doc"]`. Two nodes writing the same name is
+rejected — one would silently overwrite the other.
+
+**Feedback is addressed per target.** The routing schema returns
+`{edges: [{label, feedback}], why}`, so a role re-running after review sees the points
+meant for it and not the others'. Feedback from several branches converging on one node is
+merged.
+
+**Budgets, escalation and resets.** Per-node visits and a whole-run superstep cap, as
+before. New: a workflow may name an **escalation node**, and exhausting a budget hands over
+to it instead of failing — the example's `human_escalation`. Escalation fires at most once,
+so a looping escalation node cannot keep a run alive. An edge may **reset** named nodes'
+visit counts, which is how `route_after_pm` gives the review loop a fresh budget when it
+sends work upstream.
+
+One asymmetry worth naming: budgets are checked per node, so one exhausted arm of a
+fan-out does not stop the others — the run continues and says so with a partial
+`workflow_stopped` event. Only when *nothing* in the frontier can run does the run escalate
+or end.
+
+### 5b.3a Execution (single-path details)
+
+One `task_runs` row for the whole walk; the graph adds its own event types
+(`workflow_started`, `node_started`, `node_finished`, `edge_taken`, `workflow_stopped`,
+`workflow_finished`) to the existing stream, so run history needed no new plumbing.
+
+```
+node = start
+while node:
+    if steps >= workflow.max_steps:      stop("max_steps")
+    if visits[node] > node.max_visits:   stop("max_visits")
+    step = run_node(node)                # its own session
+    edge = choose_edge(node, outgoing, step)
+    if edge is None or edge.to is END:   stop("end")
+    node = edge.to
+```
+
+**Each visit is its own session.** `_options_for` builds a step's options by replacing
+the snapshot's roles with just that node's role and calling the *same*
+`options_builder.build_options` a flat run uses. So a step cannot be configured more
+loosely than a plain task — empty `allowed_tools`, the deny rules, the sandbox, the
+gate, all identical — and it gets no subagents, so it cannot delegate sideways. A test
+asserts this rather than trusting it. Each step sees the task goal plus a digest of what
+earlier steps produced.
+
+**Branch selection** is a separate tool-less query with `output_format` constrained to an
+enum of that node's own edge labels, so the answer is always one of the graph's edges.
+Verified live; the recorded reasoning is genuinely good, e.g. *"the checker never ran to
+completion, so this falls under rework."*
+
+Two measured details in the router, both counter-intuitive:
+
+- **`hooks=None` is required.** With a `PreToolUse` hook registered, the CLI returns an
+  *empty* structured result and routing silently falls back to the default. Bisected
+  across seven option variants. Dropping the hook costs nothing — the router session has
+  no tools for it to fire on — and `can_use_tool` stays, because removing *that* instead
+  produced `error_max_structured_output_retries`.
+- **`max_turns=1` is not enough** for structured output through a client session, though
+  it is through the one-shot `query()` helper. The router allows 4.
+
+When routing yields nothing usable it takes the default edge and emits a
+`routing_failed` event saying so. The first version fell back *silently*, which in the
+live check looked exactly like a real decision — it happened to pick correctly, and with
+a different default would have looped wrongly.
+
+**Loops are bounded twice**, and both bounds are exercised by tests: per-node
+`max_visits`, and the workflow's `max_steps`. A run stopped by either finishes as
+`failed` with `exit_reason = workflow_max_visits` / `workflow_max_steps`, because a
+workflow that ran out of budget did not reach its goal. This is not theoretical: in one
+live run Bash was unavailable, the reviewer could never confirm success, and
+`max_visits` was what ended it.
+
+### 5b.4 Editor: a draggable canvas
+
+An SVG canvas built on pointer events — no library, and it works with mouse, trackpad and
+touch alike:
+
+- **Drag a node** to move it, snapped to a 10 px grid.
+- **Drag from a node's right-hand handle** onto another node to connect them, or onto the
+  dashed `END` target to make that branch finish. A new edge gets a generated label
+  (`to_<target>`, deduplicated) and opens in the inspector for naming and a condition.
+- **Click a node or an edge label** to select it; an inspector below the canvas edits
+  everything about the selection, or deletes it. Backspace/Delete also removes it.
+- Backward edges are drawn as curves above the boxes in a different colour, so a loop can
+  never be mistaken for a forward step. Unconditional edges are dashed and the default
+  edge is thicker.
+
+**Conditions are drawn on the graph, not hidden in a tooltip.** Each edge shows its label
+and then its condition underneath, wrapped to two short lines with an ellipsis when there
+is more (the full text stays as a tooltip). A transparent rect behind the block is the
+click target, so clicking anywhere on a label — including its condition lines — selects
+the edge; clicking a bare `tspan` would otherwise miss.
+
+**An undecidable branch is visible on the canvas.** `needsCondition` marks an edge that
+leaves a branching node with no condition and is not the default: the line turns red and
+the label reads "needs a condition". Server-side validation already rejects that graph,
+but the reason used to live only in the validation box, away from the edge at fault.
+
+**Creating a branch demands a condition immediately.** Dragging a second edge out of a
+node opens the inspector with the condition field focused and outlined, and the toast
+names the node: *"test now branches — describe when 'rework' applies"*. The alternative —
+letting the edge be created silently and surfacing the problem at save time — is how the
+first version behaved, and it put the discovery a long way from the action that caused it.
+
+The pure parts of this (auto-layout fallback, condition wrapping, the
+needs-a-condition rule) are covered by `tests/graph.test.mjs`, run with `node` and no
+browser. The pointer interactions are not testable that way and are not covered.
+
+Client coordinates are mapped into the canvas with `getScreenCTM().inverse()`, so dragging
+stays correct whatever the viewBox scaling — which matters because the canvas resizes
+itself as nodes move.
+
+**Positions are optional.** `workflow_nodes.pos_x/pos_y` are nullable, and a node without
+them is placed by the layered auto-layout. So a graph built before the canvas existed, or
+built by the chat assistant, opens looking sensible; a first drag writes the auto position
+back so nothing jumps. That fallback logic is tested directly under Node.
+
+**Dragging saves through `PATCH /api/workflows/{id}/layout`, not the full save.** A
+half-assembled graph — a branch whose conditions are not written yet — is a completely
+normal thing to be dragging around, and a full `PUT` would reject it as invalid. The
+layout endpoint touches positions only and never validates the graph. There is a test
+asserting a graph that fails validation can still be repositioned.
+
+Renaming a node key rewrites the edges that reference it, since edges are keyed by node
+key rather than id in the editor's model. Unsetting the start node is refused rather than
+allowed to leave a graph with no entry point.
+
+---
+
 ## 6. Decisions
 
 Settled, and reflected above:

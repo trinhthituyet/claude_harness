@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db import dispose_db, init_db
-from app.routers import chat, fs, mcps, models, people, runs, skills, tasks
+from app.routers import chat, fs, mcps, models, people, runs, skills, tasks, workflows
 from app.services.chat import manager as chat_manager
 from app.services.runner import manager
 
@@ -53,6 +53,7 @@ def create_app() -> FastAPI:
     app.include_router(models.router)
     app.include_router(people.roles_router)
     app.include_router(people.teams_router)
+    app.include_router(workflows.router)
     app.include_router(tasks.router)
     app.include_router(runs.router)
     app.include_router(chat.router)

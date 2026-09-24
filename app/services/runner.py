@@ -15,15 +15,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from claude_agent_sdk import (
-    AssistantMessage,
     ClaudeSDKClient,
     ResultMessage,
     SystemMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
     __version__ as sdk_version,
 )
 
@@ -33,13 +27,12 @@ from app.models import PermissionDecision, Task, TaskRun
 from app.security.gate import ApprovalAnswer, Gate
 from app.security.path_guard import Verdict
 from app.security.policy import RunPolicy
-from app.services import options_builder
+from app.services import messages, options_builder
 from app.services.events import run_event_bus
 from app.services.snapshot import RunSnapshot, build_snapshot
+from app.services.workflow_runner import WorkflowOutcome, WorkflowRunner
 
 log = logging.getLogger("harness.runner")
-
-TOOL_RESULT_LIMIT = 8192
 
 
 class PreflightError(RuntimeError):
@@ -69,6 +62,8 @@ class Run:
         self._result: ResultMessage | None = None
         self._cancelled = False
         self._preflight_done = False
+        self._workflow: WorkflowRunner | None = None
+        self._workflow_outcome: WorkflowOutcome | None = None
 
     # ----------------------------------------------------------------- audit
 
@@ -94,7 +89,7 @@ class Run:
                     reason=verdict.reason,
                     candidate_paths_json=verdict.candidates,
                     resolved_paths_json=verdict.resolved,
-                    tool_input_json=_truncate_input(tool_input),
+                    tool_input_json=messages.truncate_input(tool_input),
                 )
             )
             await session.commit()
@@ -121,14 +116,16 @@ class Run:
                 "network_enabled": self.snapshot.network_enabled,
                 "lead": self.snapshot.lead.name,
                 "teammates": [r.name for r in self.snapshot.teammates],
+                "workflow": (
+                    self.snapshot.workflow.name if self.snapshot.workflow else None
+                ),
             },
         )
         try:
-            async with ClaudeSDKClient(options=options) as client:
-                self._client = client
-                await client.query(self.snapshot.prompt)
-                async for message in client.receive_response():
-                    await self._handle(message)
+            if self.snapshot.workflow is not None:
+                await self._execute_workflow()
+            else:
+                await self._execute_session(options)
         except asyncio.CancelledError:
             self._cancelled = True
             raise
@@ -140,62 +137,49 @@ class Run:
         finally:
             self.gate.fail_all_pending("run ended")
             self._client = None
+            self._workflow = None
 
         if self._cancelled:
             await self._finalize("cancelled", "cancelled", None)
         else:
             await self._finalize_from_result()
 
+    async def _execute_session(self, options) -> None:
+        """A flat team: one session, the lead delegating to subagents."""
+        async with ClaudeSDKClient(options=options) as client:
+            self._client = client
+            await client.query(self.snapshot.prompt)
+            async for message in client.receive_response():
+                await self._handle(message)
+
+    async def _execute_workflow(self) -> None:
+        """A graph: one session per step, with the runner deciding the path."""
+        runner = WorkflowRunner(
+            self.snapshot,
+            self.policy,
+            self.gate,
+            self.bus,
+            stderr_sink=self._capture_stderr,
+        )
+        self._workflow = runner
+        outcome = await runner.execute()
+        self._workflow_outcome = outcome
+        self._output = [step.output for step in outcome.steps if step.output]
+        # The last step's result stands in for the run, with the graph's totals.
+        last = next(
+            (step.result for step in reversed(outcome.steps) if step.result is not None), None
+        )
+        self._result = last
+
     async def _handle(self, message: Any) -> None:
         if isinstance(message, SystemMessage):
             await self._handle_system(message)
-        elif isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    if block.text.strip():
-                        self._output.append(block.text)
-                        await self.bus.emit(
-                            "assistant_text",
-                            {"text": block.text, "parent": message.parent_tool_use_id},
-                        )
-                elif isinstance(block, ThinkingBlock):
-                    await self.bus.emit("thinking", {"text": block.thinking[:2000]})
-                elif isinstance(block, ToolUseBlock):
-                    await self.bus.emit(
-                        "tool_use",
-                        {
-                            "id": block.id,
-                            "name": block.name,
-                            "input": _truncate_input(block.input),
-                            "parent": message.parent_tool_use_id,
-                        },
-                    )
-        elif isinstance(message, UserMessage):
-            content = message.content
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, ToolResultBlock):
-                        await self.bus.emit(
-                            "tool_result",
-                            {
-                                "id": block.tool_use_id,
-                                "is_error": bool(block.is_error),
-                                "content": _stringify(block.content)[:TOOL_RESULT_LIMIT],
-                            },
-                        )
-        elif isinstance(message, ResultMessage):
+            return
+        for type_, payload in messages.translate(message):
+            await self.bus.emit(type_, payload)
+        self._output.extend(messages.collect_text(message))
+        if isinstance(message, ResultMessage):
             self._result = message
-            await self.bus.emit(
-                "result",
-                {
-                    "subtype": message.subtype,
-                    "is_error": message.is_error,
-                    "num_turns": message.num_turns,
-                    "total_cost_usd": message.total_cost_usd,
-                    "duration_ms": message.duration_ms,
-                    "terminal_reason": message.terminal_reason,
-                },
-            )
 
     async def _handle_system(self, message: SystemMessage) -> None:
         data = message.data or {}
@@ -320,6 +304,24 @@ class Run:
                 await session.commit()
 
     async def _finalize_from_result(self) -> None:
+        outcome = self._workflow_outcome
+        if outcome is not None:
+            # A workflow's verdict is how the walk ended, not how its last step did.
+            if not outcome.steps:
+                await self._finalize("failed", "exception", "the workflow ran no steps")
+                return
+            status = "completed" if outcome.reason == "end" else "failed"
+            if outcome.reason == "cancelled":
+                status = "cancelled"
+            await self._finalize(
+                status,
+                f"workflow_{outcome.reason}",
+                None,
+                result=self._result,
+                totals=(outcome.num_turns, outcome.total_cost_usd),
+            )
+            return
+
         result = self._result
         if result is None:
             await self._finalize("failed", "exception", "session ended without a result")
@@ -334,6 +336,7 @@ class Run:
         exit_reason: str,
         error_text: str | None,
         result: ResultMessage | None = None,
+        totals: tuple[int, float] | None = None,
     ) -> None:
         async with sessionmaker()() as session:
             run = await session.get(TaskRun, self.id)
@@ -345,7 +348,9 @@ class Run:
                 if error_text:
                     stderr = "\n".join(self._stderr[-20:])
                     run.error_text = f"{error_text}\n\n{stderr}" if stderr else error_text
-                if result is not None:
+                if totals is not None:
+                    run.num_turns, run.total_cost_usd = totals
+                elif result is not None:
                     run.num_turns = result.num_turns
                     run.total_cost_usd = result.total_cost_usd
                     run.duration_ms = result.duration_ms
@@ -400,6 +405,10 @@ class Run:
     async def cancel(self) -> None:
         self._cancelled = True
         self.gate.fail_all_pending("run cancelled")
+        workflow = self._workflow
+        if workflow is not None:
+            with contextlib.suppress(Exception):
+                await workflow.cancel()
         client = self._client
         if client is not None:
             with contextlib.suppress(Exception):
@@ -410,31 +419,6 @@ class Run:
 
     def pending_approvals(self) -> list[dict[str, Any]]:
         return [req.public() for req in self.gate.pending.values()]
-
-
-def _truncate_input(tool_input: dict[str, Any]) -> dict[str, Any]:
-    """Keep tool inputs loggable: long file contents are the common offender."""
-    out: dict[str, Any] = {}
-    for key, value in (tool_input or {}).items():
-        if isinstance(value, str) and len(value) > 2000:
-            out[key] = value[:2000] + f"… [{len(value)} chars]"
-        else:
-            out[key] = value
-    return out
-
-
-def _stringify(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(str(item.get("text") or item))
-            else:
-                parts.append(str(item))
-        return "\n".join(parts)
-    return str(content)
 
 
 class RunManager:
@@ -471,6 +455,9 @@ class RunManager:
                 prompt_snapshot=snapshot.prompt,
                 project_path_snapshot=str(snapshot.root),
                 team_snapshot_json=snapshot.team_public(),
+                workflow_snapshot_json=(
+                    snapshot.workflow.public() if snapshot.workflow else {}
+                ),
                 model_snapshot_json=snapshot.model.public(),
                 skills_snapshot_json=list(snapshot.skills),
                 mcps_snapshot_json=sorted(snapshot.mcp_servers),

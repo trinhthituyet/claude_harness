@@ -37,7 +37,14 @@ class Task(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(200))
     prompt: Mapped[str] = mapped_column(Text)
     project_path: Mapped[str] = mapped_column(Text)
-    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="RESTRICT"))
+    # A task runs either a flat team (one session, lead delegates) or a workflow
+    # (a graph of roles, one session per step). Exactly one is set.
+    team_id: Mapped[int | None] = mapped_column(
+        ForeignKey("teams.id", ondelete="RESTRICT"), nullable=True
+    )
+    workflow_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="RESTRICT"), nullable=True
+    )
     model_config_id: Mapped[int | None] = mapped_column(
         ForeignKey("model_configs.id", ondelete="SET NULL"), nullable=True
     )
@@ -53,6 +60,7 @@ class Task(Base, TimestampMixin):
     max_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     team = relationship("Team", lazy="selectin")
+    workflow = relationship("Workflow", lazy="selectin")
     skill_links: Mapped[list[TaskSkill]] = relationship(
         cascade="all, delete-orphan", lazy="selectin"
     )

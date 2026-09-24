@@ -7,10 +7,11 @@ import * as mcps from "./views/mcps.js";
 import * as models from "./views/models.js";
 import * as roles from "./views/roles.js";
 import * as teams from "./views/teams.js";
+import * as workflows from "./views/workflows.js";
 import * as tasks from "./views/tasks.js";
 import * as runs from "./views/runs.js";
 
-const VIEWS = { chat, skills, mcps, models, roles, teams, tasks, runs };
+const VIEWS = { chat, skills, mcps, models, roles, teams, workflows, tasks, runs };
 const panel = document.getElementById("panel");
 const nav = document.getElementById("nav");
 let cleanup = null;

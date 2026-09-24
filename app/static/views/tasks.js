@@ -1,13 +1,14 @@
 import { api, checkbox, confirmDelete, el, emptyState, field, mount, toast } from "../lib.js";
 
 export async function render(panel, arg) {
-  const [tasks, teams, roles, models, skills, mcps] = await Promise.all([
+  const [tasks, teams, roles, models, skills, mcps, workflows] = await Promise.all([
     api("/api/tasks"),
     api("/api/teams"),
     api("/api/roles"),
     api("/api/models"),
     api("/api/skills"),
     api("/api/mcps"),
+    api("/api/workflows"),
   ]);
   const editing = arg ? tasks.find((t) => String(t.id) === arg) : null;
 
@@ -24,7 +25,7 @@ export async function render(panel, arg) {
 
     el("h3", {}, editing ? `Edit ${editing.name}` : "Create a task"),
     teams.length || roles.length
-      ? form(editing, { teams, roles, models, skills, mcps }, panel)
+      ? form(editing, { teams, roles, models, skills, mcps, workflows }, panel)
       : emptyState("Add at least one role first: a task needs a team, and a team needs a role.")
   );
 }
@@ -33,7 +34,8 @@ function card(task, panel) {
   return el("div", { class: "card" },
     el("div", { class: "card-head" },
       el("strong", {}, task.name),
-      el("span", { class: "tag" }, task.team_name),
+      el("span", { class: task.workflow_name ? "tag lead" : "tag" },
+        task.workflow_name ? `workflow: ${task.workflow_name}` : task.team_name),
       task.paranoid_mode ? el("span", { class: "tag warn" }, "paranoid") : null,
       task.sandbox_bash ? null : el("span", { class: "tag danger" }, "Bash unconfined"),
       task.network_enabled ? el("span", { class: "tag warn" }, "network") : null,
@@ -80,7 +82,7 @@ function multiSelect(name, options, selectedIds, labelOf) {
 }
 
 function form(editing, data, panel) {
-  const { teams, roles, models, skills, mcps } = data;
+  const { teams, roles, models, skills, mcps, workflows } = data;
 
   // --- project path, with live validation -------------------------------
   const pathInput = el("input", {
@@ -118,7 +120,15 @@ function form(editing, data, panel) {
     teams.map((team) =>
       el("option", { value: team.id, selected: editing?.team_id === team.id },
         `${team.name} (${team.members.length})`)),
-    el("option", { value: "__inline__" }, "+ define a new team inline"));
+    el("option", { value: "__inline__" }, "+ define a new team inline"),
+    workflows.length
+      ? el("optgroup", { label: "Workflows (a graph of roles)" },
+          workflows.map((w) =>
+            el("option", {
+              value: `wf:${w.id}`,
+              selected: editing?.workflow_id === w.id,
+            }, `${w.name} (${w.nodes.length} steps)`)))
+      : null);
 
   const inlineName = el("input", { name: "inline_name", placeholder: "Feature squad" });
   const inlineRoles = multiSelect("inline_role_ids", roles, [], (r) => r.name);
@@ -227,7 +237,9 @@ function form(editing, data, panel) {
         max_turns: null,
         max_budget_usd: null,
       };
-      if (teamSelect.value === "__inline__") {
+      if (teamSelect.value.startsWith("wf:")) {
+        body.workflow_id = Number(teamSelect.value.slice(3));
+      } else if (teamSelect.value === "__inline__") {
         body.inline_team = {
           name: inlineName.value.trim(),
           description: "",
@@ -238,7 +250,7 @@ function form(editing, data, panel) {
       } else if (teamSelect.value) {
         body.team_id = Number(teamSelect.value);
       } else {
-        toast("Choose a team, or define one inline", true);
+        toast("Choose a team or a workflow, or define a team inline", true);
         return;
       }
       try {
@@ -258,7 +270,11 @@ function form(editing, data, panel) {
     el("label", {}, "Project path",
       el("span", { class: "hint" }, "Writes are confined here. Must exist and be a directory."),
       pathInput, pathState),
-    el("div", { class: "row" }, field("Team", teamSelect), field("Model", modelSelect)),
+    el("div", { class: "row" },
+      field("Team or workflow", teamSelect,
+        "A team runs one session with the lead delegating. A workflow runs the graph, " +
+        "one session per step."),
+      field("Model", modelSelect)),
     inlineBlock,
     el("div", { class: "row" },
       field("Skills", skillSelect, installedSkills.length ? null : "None installed."),

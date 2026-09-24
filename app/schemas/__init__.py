@@ -247,6 +247,8 @@ class TaskIn(BaseModel):
     project_path: str = Field(min_length=1)
     team_id: int | None = None
     inline_team: InlineTeam | None = None
+    #: Alternative to a team: run a graph of roles instead of one delegating session.
+    workflow_id: int | None = None
     model_config_id: int | None = None
     skill_ids: list[int] = Field(default_factory=list)
     mcp_server_ids: list[int] = Field(default_factory=list)
@@ -263,10 +265,21 @@ class TaskIn(BaseModel):
             raise ValueError("a task needs a prompt")
         if not self.project_path.strip():
             raise ValueError("a task needs a project path")
-        if self.team_id is None and self.inline_team is None:
-            raise ValueError("a task needs either an existing team or an inline team")
-        if self.team_id is not None and self.inline_team is not None:
-            raise ValueError("pass either team_id or inline_team, not both")
+        chosen = [
+            name
+            for name, value in (
+                ("team_id", self.team_id),
+                ("inline_team", self.inline_team),
+                ("workflow_id", self.workflow_id),
+            )
+            if value is not None
+        ]
+        if not chosen:
+            raise ValueError(
+                "a task needs an existing team, an inline team, or a workflow"
+            )
+        if len(chosen) > 1:
+            raise ValueError(f"pass only one of team_id, inline_team or workflow_id, got {chosen}")
         if self.inline_team is not None:
             self.inline_team.check()
 
@@ -276,8 +289,10 @@ class TaskOut(BaseModel):
     name: str
     prompt: str
     project_path: str
-    team_id: int
+    team_id: int | None
     team_name: str
+    workflow_id: int | None
+    workflow_name: str
     model_config_id: int | None
     skill_ids: list[int]
     mcp_server_ids: list[int]
@@ -298,6 +313,8 @@ class TaskOut(BaseModel):
             project_path=row.project_path,
             team_id=row.team_id,
             team_name=row.team.name if row.team else "",
+            workflow_id=row.workflow_id,
+            workflow_name=row.workflow.name if row.workflow else "",
             model_config_id=row.model_config_id,
             skill_ids=[link.skill_id for link in row.skill_links],
             mcp_server_ids=[link.server_id for link in row.mcp_links],
@@ -308,6 +325,144 @@ class TaskOut(BaseModel):
             approval_timeout_s=row.approval_timeout_s,
             max_turns=row.max_turns,
             max_budget_usd=row.max_budget_usd,
+        )
+
+
+# ------------------------------------------------------------------- workflows
+
+
+class WorkflowNodeIn(BaseModel):
+    key: str = Field(min_length=1, max_length=64)
+    role_id: int
+    instructions: str = ""
+    is_start: bool = False
+    max_visits: int = Field(default=3, ge=1, le=20)
+    #: What this step's output is filed under for later steps. Defaults to the key.
+    output_key: str | None = Field(default=None, max_length=64)
+    #: Canvas position. Omitted means "lay it out automatically".
+    pos_x: float | None = None
+    pos_y: float | None = None
+
+
+class WorkflowEdgeIn(BaseModel):
+    from_key: str = Field(min_length=1)
+    #: None or "END" finishes the workflow.
+    to_key: str | None = None
+    label: str = Field(min_length=1, max_length=64)
+    condition: str = ""
+    is_default: bool = False
+    #: Node keys whose visit budget resets when this edge is taken.
+    resets: list[str] = Field(default_factory=list)
+
+
+class WorkflowIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str = ""
+    max_steps: int = Field(default=20, ge=1, le=100)
+    #: Where to go when a budget runs out, instead of failing the run.
+    escalation_key: str | None = Field(default=None, max_length=64)
+    nodes: list[WorkflowNodeIn] = Field(min_length=1)
+    edges: list[WorkflowEdgeIn] = Field(default_factory=list)
+
+    def check(self) -> None:
+        from app.services import graph
+
+        graph.validate(
+            [
+                graph.NodeSpec(n.key, n.is_start, n.max_visits, n.output_key)
+                for n in self.nodes
+            ],
+            [
+                graph.EdgeSpec(
+                    e.from_key, e.to_key, e.label, e.condition, e.is_default,
+                    tuple(e.resets),
+                )
+                for e in self.edges
+            ],
+            self.escalation_key,
+        )
+
+
+class WorkflowNodeOut(BaseModel):
+    id: int
+    key: str
+    role_id: int
+    role_name: str
+    instructions: str
+    is_start: bool
+    max_visits: int
+    output_key: str
+    pos_x: float | None
+    pos_y: float | None
+
+
+class NodePosition(BaseModel):
+    key: str
+    x: float
+    y: float
+
+
+class LayoutIn(BaseModel):
+    """Positions only: dragging should not rewrite or revalidate the graph."""
+
+    positions: list[NodePosition] = Field(min_length=1)
+
+
+class WorkflowEdgeOut(BaseModel):
+    id: int
+    from_key: str
+    to_key: str | None
+    label: str
+    condition: str
+    is_default: bool
+    resets: list[str]
+
+
+class WorkflowOut(BaseModel):
+    id: int
+    name: str
+    description: str
+    max_steps: int
+    escalation_key: str | None
+    nodes: list[WorkflowNodeOut]
+    edges: list[WorkflowEdgeOut]
+
+    @classmethod
+    def of(cls, row) -> "WorkflowOut":
+        by_id = {node.id: node for node in row.nodes}
+        return cls(
+            id=row.id,
+            name=row.name,
+            description=row.description,
+            max_steps=row.max_steps,
+            escalation_key=row.escalation_key,
+            nodes=[
+                WorkflowNodeOut(
+                    id=node.id,
+                    key=node.key,
+                    role_id=node.role_id,
+                    role_name=node.role.name if node.role else "",
+                    instructions=node.instructions,
+                    is_start=node.is_start,
+                    max_visits=node.max_visits,
+                    output_key=node.output_key or node.key,
+                    pos_x=node.pos_x,
+                    pos_y=node.pos_y,
+                )
+                for node in row.nodes
+            ],
+            edges=[
+                WorkflowEdgeOut(
+                    id=edge.id,
+                    from_key=by_id[edge.from_node_id].key if edge.from_node_id in by_id else "",
+                    to_key=by_id[edge.to_node_id].key if edge.to_node_id in by_id else None,
+                    label=edge.label,
+                    condition=edge.condition,
+                    is_default=edge.is_default,
+                    resets=list(edge.resets_json or []),
+                )
+                for edge in row.edges
+            ],
         )
 
 

@@ -30,6 +30,7 @@ class TaskRun(Base):
     prompt_snapshot: Mapped[str] = mapped_column(Text, default="")
     project_path_snapshot: Mapped[str] = mapped_column(Text, default="")
     team_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    workflow_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     model_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     skills_snapshot_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     mcps_snapshot_json: Mapped[list[str]] = mapped_column(JSON, default=list)

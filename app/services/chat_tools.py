@@ -23,8 +23,18 @@ from claude_agent_sdk import ToolAnnotations, create_sdk_mcp_server, tool
 from sqlalchemy import select
 
 from app.db import sessionmaker
-from app.models import McpServer, ModelConfig, Role, Skill, Task, Team, TeamRole
-from app.schemas import McpIn, ModelIn, RoleIn, TaskIn, TeamIn, TeamMemberIn
+from app.models import McpServer, ModelConfig, Role, Skill, Task, Team, TeamRole, Workflow
+from app.schemas import (
+    McpIn,
+    ModelIn,
+    RoleIn,
+    TaskIn,
+    TeamIn,
+    TeamMemberIn,
+    WorkflowEdgeIn,
+    WorkflowIn,
+    WorkflowNodeIn,
+)
 from app.security.policy import PolicyError, resolve_project_root
 from app.services import crud
 from app.services.catalog import ANTHROPIC_MODELS
@@ -44,6 +54,7 @@ READ_ONLY_TOOLS: frozenset[str] = frozenset(
         "list_model_configs",
         "list_skills",
         "list_tasks",
+        "list_workflows",
         "check_project_path",
     }
 )
@@ -327,7 +338,8 @@ async def add_model_config(session, args):
         "name": str,
         "prompt": Annotated[str, "The instruction the session will run"],
         "project_path": Annotated[str, "Absolute directory the task operates on"],
-        "team_id": int,
+        "team_id": Annotated[int, "0 or omitted when using workflow_id"],
+        "workflow_id": Annotated[int, "run a workflow graph instead of a flat team"],
         "model_config_id": Annotated[int, "0 or omitted means the default model config"],
         "skill_ids": list[int],
         "mcp_server_ids": list[int],
@@ -345,7 +357,8 @@ async def create_task(session, args):
             name=args["name"],
             prompt=args["prompt"],
             project_path=args["project_path"],
-            team_id=int(args["team_id"]),
+            team_id=int(args["team_id"]) if args.get("team_id") else None,
+            workflow_id=int(args["workflow_id"]) if args.get("workflow_id") else None,
             model_config_id=int(model_config_id) if model_config_id else None,
             skill_ids=[int(s) for s in (args.get("skill_ids") or [])],
             mcp_server_ids=[int(s) for s in (args.get("mcp_server_ids") or [])],
@@ -372,6 +385,104 @@ async def run_task(session, args):
     return ok({"started": "run", "run_id": run_id, "task": crud.summarise(task)})
 
 
+
+@tool("list_workflows", "List the configured workflows and their graphs.", {},
+      annotations=READ_ONLY)
+@_handler
+async def list_workflows(session, args):
+    from sqlalchemy.orm import selectinload
+
+    from app.models import WorkflowNode
+
+    rows = (
+        await session.execute(
+            select(Workflow).options(
+                selectinload(Workflow.nodes).selectinload(WorkflowNode.role),
+                selectinload(Workflow.edges),
+            )
+        )
+    ).scalars().all()
+    return ok([crud.summarise_workflow(r) for r in rows])
+
+
+@tool(
+    "create_workflow",
+    "Create a workflow: a graph of roles describing how the team works. Each node is one "
+    "role doing a step; each edge is a transition. An edge whose to_key is null or 'END' "
+    "finishes the workflow, and an edge pointing back to an earlier node makes a loop.\n"
+    "A node with SEVERAL UNCONDITIONAL edges fans out: every arm runs in parallel. "
+    "Several edges converging on one node join there, and it runs once after they all "
+    "finish. A node whose edges carry CONDITIONS branches instead, and the router may "
+    "select more than one — use that to send work back to just the roles with problems. "
+    "Do not mix unconditional and conditional edges out of one node; that is rejected.",
+    {
+        "name": str,
+        "description": str,
+        "max_steps": Annotated[int, "Ceiling on supersteps for one run; 20 is sensible"],
+        "escalation_key": Annotated[
+            str,
+            "Node to hand over to when a budget runs out, instead of failing. Optional.",
+        ],
+        "nodes": Annotated[
+            list[dict],
+            "Each: {key, role_id, instructions, is_start, max_visits, output_key}. "
+            "Exactly one start. output_key names this step's result for later steps "
+            "(e.g. arch_doc, design_doc, code); it must be unique.",
+        ],
+        "edges": Annotated[
+            list[dict],
+            "Each: {from_key, to_key (null for END), label, condition, is_default, "
+            "resets}. resets lists node keys whose visit budget starts again when this "
+            "edge is taken — for sending work upstream with a fresh loop budget.",
+        ],
+    },
+)
+@_handler
+async def create_workflow(session, args):
+    try:
+        payload = WorkflowIn(
+            name=args["name"],
+            description=args.get("description", ""),
+            max_steps=int(args.get("max_steps") or 20),
+            escalation_key=(str(args["escalation_key"]).strip().lower() or None)
+            if args.get("escalation_key")
+            else None,
+            nodes=[
+                WorkflowNodeIn(
+                    key=str(n["key"]).strip().lower(),
+                    role_id=int(n["role_id"]),
+                    instructions=str(n.get("instructions", "")),
+                    is_start=bool(n.get("is_start", False)),
+                    max_visits=int(n.get("max_visits") or 3),
+                    output_key=(str(n["output_key"]).strip().lower()
+                                if n.get("output_key") else None),
+                )
+                for n in args["nodes"]
+            ],
+            edges=[
+                WorkflowEdgeIn(
+                    from_key=str(e["from_key"]).strip().lower(),
+                    to_key=(
+                        None
+                        if e.get("to_key") in (None, "", "END", "end")
+                        else str(e["to_key"]).strip().lower()
+                    ),
+                    label=str(e["label"]).strip().lower(),
+                    condition=str(e.get("condition", "")),
+                    is_default=bool(e.get("is_default", False)),
+                    resets=[str(r).strip().lower() for r in (e.get("resets") or [])],
+                )
+                for e in (args.get("edges") or [])
+            ],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return fail(f"could not read the graph: {exc}")
+
+    row = await crud.create_workflow(session, payload)
+    loaded = await crud.load_workflow(session, row.id)
+    return ok({"created": "workflow", **crud.summarise_workflow(loaded)})
+
+
 ALL_TOOLS = [
     list_roles,
     get_role,
@@ -380,6 +491,7 @@ ALL_TOOLS = [
     list_model_configs,
     list_skills,
     list_tasks,
+    list_workflows,
     check_project_path,
     create_role,
     update_role,
@@ -387,6 +499,7 @@ ALL_TOOLS = [
     add_mcp_server,
     add_model_config,
     create_task,
+    create_workflow,
     run_task,
 ]
 

@@ -227,3 +227,72 @@ th { color: var(--text-dim); font-weight: 500; font-size: 12px; }
 td.mono, .mono { font-family: var(--mono); font-size: 12px; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: var(--bg-raised); }
+
+/* --------------------------------------------------------------- workflows */
+
+.graph-wrap {
+  overflow-x: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+  margin-bottom: 12px;
+}
+svg.graph { display: block; min-width: 100%; height: auto; }
+svg.graph text { font-family: var(--mono); fill: var(--text); }
+svg.graph .g-key { font-size: 12px; font-weight: 600; }
+svg.graph .g-role { font-size: 10.5px; fill: var(--text-dim); }
+svg.graph .g-label { font-size: 10px; fill: var(--text-dim); }
+svg.graph .g-end { font-size: 10px; fill: var(--ok); font-weight: 600; }
+
+.ev.node_started .k, .ev.node_finished .k { color: var(--accent); }
+.ev.node_started { border-top: 1px solid var(--border); margin-top: 4px; }
+.ev.edge_taken .k, .ev.edge_taken { color: var(--warn); }
+.ev.workflow_started .k, .ev.workflow_finished .k, .ev.workflow_stopped .k { color: var(--ok); }
+
+/* Editing canvas */
+.graph-wrap.editable { padding: 0; }
+svg.graph { touch-action: none; }
+svg.graph:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+svg.graph .g-node { cursor: grab; }
+svg.graph .g-node.selected rect { filter: brightness(1.15); }
+svg.graph .g-start { font-size: 9px; fill: var(--accent); }
+svg.graph .g-handle {
+  fill: var(--bg-input);
+  stroke: var(--text-dim);
+  stroke-width: 1.5;
+  cursor: crosshair;
+}
+svg.graph .g-handle:hover { fill: var(--accent); stroke: var(--accent); }
+svg.graph .g-label.hit { cursor: pointer; }
+svg.graph .g-label.hit:hover { fill: var(--text); }
+svg.graph .g-label.selected { fill: var(--accent); font-weight: 600; }
+svg.graph .g-endzone { pointer-events: none; }
+
+.inspector {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  background: var(--bg-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.inspector .sub { margin: 0; }
+
+/* Conditions drawn on the graph */
+svg.graph .g-cond { font-size: 9.5px; fill: var(--text-dim); font-style: italic; }
+svg.graph .g-cond.missing { fill: var(--danger); font-style: normal; font-weight: 600; }
+svg.graph .g-label.missing { fill: var(--danger); }
+svg.graph .g-labelhit { cursor: pointer; }
+svg.graph .g-labelblock:hover .g-label { fill: var(--text); }
+
+input.needs-value, textarea.needs-value {
+  border-color: var(--danger);
+  box-shadow: inset 0 0 0 1px var(--danger);
+}
+svg.graph .g-artifact { font-size: 9px; fill: var(--ok); font-family: var(--mono); }
+.ev.superstep .k, .ev.superstep { color: var(--ok); }
+.ev.visits_reset .k { color: var(--warn); }
+.ev.routing_failed .k, .ev.routing_failed { color: var(--danger); }

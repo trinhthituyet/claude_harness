@@ -55,7 +55,7 @@ async def update_task(task_id: int, payload: TaskIn, session: AsyncSession = Dep
     try:
         task = await crud.load_task(session, task_id)
         await crud.assert_references_exist(session, payload)
-        task.team_id = await crud.resolve_task_team(session, payload)
+        task.team_id, task.workflow_id = await crud.resolve_task_team(session, payload)
         crud.apply_task_flags(task, payload)
         await crud.set_task_links(session, task, payload)
         loaded = await crud.load_task(session, task_id)

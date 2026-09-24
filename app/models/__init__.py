@@ -6,6 +6,7 @@ from app.models.chat import ChatMessage, ChatSession
 from app.models.run import PermissionDecision, RunEvent, TaskRun
 from app.models.task import Task, TaskMcpServer, TaskSkill
 from app.models.team import Role, Team, TeamRole
+from app.models.workflow import END, Workflow, WorkflowEdge, WorkflowNode
 
 __all__ = [
     "Base",
@@ -25,4 +26,8 @@ __all__ = [
     "PermissionDecision",
     "ChatSession",
     "ChatMessage",
+    "Workflow",
+    "WorkflowNode",
+    "WorkflowEdge",
+    "END",
 ]

@@ -93,6 +93,15 @@ async function renderRun(panel, runId) {
               el("td", {}, decision.reason)))))
       : emptyState("No tool calls were gated yet."),
 
+    Object.keys(detail.workflow || {}).length
+      ? el("div", {},
+          el("h3", {}, `Workflow: ${detail.workflow.name}`),
+          el("p", { class: "mono" },
+            `start ${detail.workflow.start} · ${detail.workflow.nodes.length} nodes · ` +
+            `${detail.workflow.edges.length} edges · max ${detail.workflow.max_steps} steps` +
+            (detail.workflow.escalation ? ` · escalates to ${detail.workflow.escalation}` : "")))
+      : null,
+
     el("h3", {}, "Session options"),
     el("pre", { class: "mono" }, JSON.stringify(detail.options || {}, null, 2))
   );
@@ -149,7 +158,10 @@ async function renderRun(panel, runId) {
     append(event);
   };
   for (const type of ["assistant_text", "thinking", "tool_use", "tool_result", "system",
-                      "status", "result", "error", "permission"]) {
+                      "status", "result", "error", "permission", "workflow_started",
+                      "superstep", "node_started", "node_finished", "edge_taken",
+                      "visits_reset", "routing_failed", "workflow_stopped",
+                      "workflow_finished"]) {
     source.addEventListener(type, (message) => {
       let event;
       try { event = JSON.parse(message.data); } catch { return; }
@@ -199,6 +211,47 @@ function eventLine(event) {
     case "permission_request": text = `needs approval — ${payload.reason}`; break;
     case "permission_resolved": text = `approval ${payload.outcome}`; break;
     case "permission": text = `${payload.decision || payload.layer}: ${payload.reason || payload.note || ""}`; break;
+    case "workflow_started":
+      text = `${payload.name}: ${payload.nodes.map((n) => n.key).join(", ")} ` +
+        `(start: ${payload.start}, max ${payload.max_steps} steps` +
+        (payload.escalation ? `, escalates to ${payload.escalation}` : "") + ")";
+      break;
+    case "superstep":
+      text = `step ${payload.index}: ${payload.parallel.join(" ‖ ")} running in parallel`;
+      break;
+    case "node_started":
+      text = `▶ ${payload.node} — ${payload.role}` +
+        (payload.max_visits > 1 ? ` (visit ${payload.visit}/${payload.max_visits})` : "") +
+        (payload.feedback?.length ? ` · with feedback: ${payload.feedback.join("; ").slice(0, 120)}` : "");
+      break;
+    case "node_finished":
+      text = `✓ ${payload.node} → ${payload.artifact} (${payload.chars} chars)` +
+        (payload.cost_usd ? ` · $${payload.cost_usd.toFixed(4)}` : "");
+      break;
+    case "visits_reset":
+      text = `↺ ${payload.node} visit budget reset by ${payload.by}`;
+      break;
+    case "routing_failed":
+      text = `routing produced nothing usable for ${payload.node}` +
+        (payload.fallback ? ` — took the default "${payload.fallback}"` : " — and there is no default") +
+        (payload.detail ? ` (${payload.detail})` : "");
+      break;
+    case "edge_taken":
+      text = `${payload.from} → ${payload.to}` +
+        (payload.label ? ` via ${payload.label}` : "") +
+        (payload.why ? ` — ${payload.why}` : "") +
+        (payload.feedback ? `\n    feedback: ${payload.feedback}` : "");
+      break;
+    case "workflow_stopped":
+      text = `${payload.partial ? "partly stopped" : "stopped"}: ${payload.reason}` +
+        (payload.nodes ? ` (${payload.nodes.join(", ")})` : "") +
+        (payload.note ? ` — ${payload.note}` : "");
+      break;
+    case "workflow_finished":
+      text = `${payload.reason} after ${payload.steps} steps in ` +
+        `${payload.supersteps} supersteps: ${(payload.path || []).join(" → ")}` +
+        (payload.artifacts?.length ? `\n    produced: ${payload.artifacts.join(", ")}` : "");
+      break;
     case "status": text = `${payload.state}${payload.exit_reason ? ` (${payload.exit_reason})` : ""}`; break;
     case "result":
       text = `${payload.subtype} · ${payload.num_turns} turns · ` +

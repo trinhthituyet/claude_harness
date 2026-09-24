@@ -24,9 +24,11 @@ from app.models import (
     TaskSkill,
     Team,
     TeamRole,
+    Workflow,
 )
-from app.schemas import InlineTeam, McpIn, ModelIn, RoleIn, TaskIn, TeamIn
+from app.schemas import InlineTeam, McpIn, ModelIn, RoleIn, TaskIn, TeamIn, WorkflowIn
 from app.security.policy import PolicyError, resolve_project_root
+from app.services import graph
 
 
 class CrudError(ValueError):
@@ -241,13 +243,163 @@ async def create_model_config(session: AsyncSession, payload: ModelIn) -> ModelC
     return row
 
 
+# ------------------------------------------------------------------- workflows
+
+
+def workflow_loaders():
+    from app.models import WorkflowEdge, WorkflowNode
+
+    return (
+        selectinload(Workflow.nodes).selectinload(WorkflowNode.role),
+        selectinload(Workflow.edges),
+    )
+
+
+async def load_workflow(session: AsyncSession, workflow_id: int) -> Workflow:
+    stmt = (
+        select(Workflow)
+        .options(*workflow_loaders())
+        .where(Workflow.id == workflow_id)
+        .execution_options(populate_existing=True)
+    )
+    row = (await session.execute(stmt)).scalars().first()
+    if row is None:
+        raise CrudError(f"no workflow with id {workflow_id}")
+    return row
+
+
+async def _write_graph(session: AsyncSession, workflow: Workflow, payload: WorkflowIn) -> None:
+    """Replace a workflow's nodes and edges wholesale.
+
+    Edges arrive keyed by node *key* rather than id, which is what both the editor and
+    the chat assistant naturally produce, so nodes are inserted first to resolve them.
+    """
+    from app.models import WorkflowEdge, WorkflowNode
+
+    await session.execute(delete(WorkflowEdge).where(WorkflowEdge.workflow_id == workflow.id))
+    await session.execute(delete(WorkflowNode).where(WorkflowNode.workflow_id == workflow.id))
+    await session.flush()
+
+    role_ids = [node.role_id for node in payload.nodes]
+    await assert_roles_exist(session, role_ids)
+
+    has_start = any(node.is_start for node in payload.nodes)
+    by_key: dict[str, WorkflowNode] = {}
+    for position, node in enumerate(payload.nodes):
+        row = WorkflowNode(
+            workflow_id=workflow.id,
+            key=node.key,
+            role_id=node.role_id,
+            instructions=node.instructions,
+            is_start=node.is_start or (not has_start and position == 0),
+            max_visits=node.max_visits,
+            output_key=node.output_key or node.key,
+            position=position,
+            pos_x=node.pos_x,
+            pos_y=node.pos_y,
+        )
+        session.add(row)
+        by_key[node.key] = row
+    await session.flush()
+
+    for position, edge in enumerate(payload.edges):
+        session.add(
+            WorkflowEdge(
+                workflow_id=workflow.id,
+                from_node_id=by_key[edge.from_key].id,
+                to_node_id=(
+                    None if edge.to_key in (None, graph.END) else by_key[edge.to_key].id
+                ),
+                label=edge.label,
+                condition=edge.condition,
+                is_default=edge.is_default,
+                resets_json=list(edge.resets),
+                position=position,
+            )
+        )
+    await session.flush()
+
+
+async def create_workflow(session: AsyncSession, payload: WorkflowIn) -> Workflow:
+    payload.check()
+    if (
+        await session.execute(select(Workflow).where(Workflow.name == payload.name))
+    ).scalars().first():
+        raise CrudError(f"a workflow named {payload.name!r} already exists", conflict=True)
+    workflow = Workflow(
+        name=payload.name, description=payload.description, max_steps=payload.max_steps,
+        escalation_key=payload.escalation_key,
+    )
+    session.add(workflow)
+    await session.flush()
+    await _write_graph(session, workflow, payload)
+    return workflow
+
+
+async def update_workflow(
+    session: AsyncSession, workflow_id: int, payload: WorkflowIn
+) -> Workflow:
+    payload.check()
+    workflow = await load_workflow(session, workflow_id)
+    clash = (
+        await session.execute(
+            select(Workflow).where(Workflow.name == payload.name, Workflow.id != workflow_id)
+        )
+    ).scalars().first()
+    if clash is not None:
+        raise CrudError(f"another workflow is named {payload.name!r}", conflict=True)
+    workflow.name = payload.name
+    workflow.description = payload.description
+    workflow.max_steps = payload.max_steps
+    workflow.escalation_key = payload.escalation_key
+    await _write_graph(session, workflow, payload)
+    return workflow
+
+
+def summarise_workflow(row: Workflow) -> dict[str, Any]:
+    """A compact description for the chat assistant and for run snapshots."""
+    by_id = {node.id: node for node in row.nodes}
+    return {
+        "id": row.id,
+        "name": row.name,
+        "max_steps": row.max_steps,
+        "escalation": row.escalation_key,
+        "start": next((n.key for n in row.nodes if n.is_start), None),
+        "nodes": [
+            {
+                "key": node.key,
+                "role": node.role.name if node.role else None,
+                "instructions": node.instructions,
+                "max_visits": node.max_visits,
+                "output_key": node.output_key or node.key,
+            }
+            for node in row.nodes
+        ],
+        "edges": [
+            {
+                "from": by_id[edge.from_node_id].key if edge.from_node_id in by_id else None,
+                "to": by_id[edge.to_node_id].key if edge.to_node_id in by_id else graph.END,
+                "label": edge.label,
+                "condition": edge.condition,
+                "is_default": edge.is_default,
+                "resets": list(edge.resets_json or []),
+            }
+            for edge in row.edges
+        ],
+    }
+
+
 # ----------------------------------------------------------------------- tasks
 
 
 def task_loaders():
     """Eager-load everything TaskOut and the run snapshot read."""
+    from app.models import WorkflowNode
+
     return (
         selectinload(Task.team).selectinload(Team.members).selectinload(TeamRole.role),
+        selectinload(Task.workflow).selectinload(Workflow.nodes).selectinload(WorkflowNode.role),
+        selectinload(Task.workflow).selectinload(Workflow.edges),
         selectinload(Task.skill_links),
         selectinload(Task.mcp_links),
     )
@@ -314,14 +466,19 @@ async def set_task_links(session: AsyncSession, task: Task, payload: TaskIn) -> 
         session.add(TaskMcpServer(task_id=task.id, server_id=server_id))
 
 
-async def resolve_task_team(session: AsyncSession, payload: TaskIn) -> int:
-    """Either validate the chosen team, or build the inline one."""
+async def resolve_task_team(session: AsyncSession, payload: TaskIn) -> tuple[int | None, int | None]:
+    """Resolve what the task will run: ``(team_id, workflow_id)``, one of them set."""
+    if payload.workflow_id is not None:
+        workflow = await load_workflow(session, payload.workflow_id)
+        if not workflow.nodes:
+            raise CrudError(f"workflow {workflow.name!r} has no nodes")
+        return None, workflow.id
     if payload.inline_team is not None:
-        return await materialise_inline_team(session, payload.inline_team)
+        return await materialise_inline_team(session, payload.inline_team), None
     team = await load_team(session, payload.team_id)
     if not team.members:
         raise CrudError(f"team {team.name!r} has no roles")
-    return team.id
+    return team.id, None
 
 
 async def create_task(session: AsyncSession, payload: TaskIn) -> Task:
@@ -332,9 +489,9 @@ async def create_task(session: AsyncSession, payload: TaskIn) -> Task:
         raise CrudError(str(exc)) from exc
     await assert_references_exist(session, payload)
 
-    team_id = await resolve_task_team(session, payload)
-    row = Task(team_id=team_id, name=payload.name, prompt=payload.prompt,
-               project_path=payload.project_path)
+    team_id, workflow_id = await resolve_task_team(session, payload)
+    row = Task(team_id=team_id, workflow_id=workflow_id, name=payload.name,
+               prompt=payload.prompt, project_path=payload.project_path)
     apply_task_flags(row, payload)
     session.add(row)
     await session.flush()

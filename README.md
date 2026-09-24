@@ -18,9 +18,12 @@ VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
 Then open <http://localhost:8000>. Single local user, no auth.
 
 ```bash
-.venv/bin/python -m pytest                   # unit + API tests, no network
-.venv/bin/python scripts/e2e_check.py        # real task session; costs a few cents
-.venv/bin/python scripts/e2e_chat_check.py   # real chat session; costs a few cents
+.venv/bin/python -m pytest                       # unit + API tests, no network
+node tests/graph.test.mjs                        # frontend graph logic, no browser
+.venv/bin/python scripts/e2e_check.py            # real task session; a few cents
+.venv/bin/python scripts/e2e_chat_check.py       # real chat session; a few cents
+.venv/bin/python scripts/e2e_workflow_check.py   # real workflow with a loop; ~25c
+.venv/bin/python scripts/e2e_example_graph_check.py   # the LangGraph example shape; ~45c
 ```
 
 ## Configuration
@@ -61,10 +64,41 @@ erroring. `/api/health` reports which binary is in use.
 4. **Roles** — name, description and system prompt. The description is what the lead role
    sees when deciding whom to delegate to.
 5. **Teams** — one or more roles, exactly one lead.
-6. **Tasks** — prompt, project path (validated live), team (existing or defined inline,
-   including roles created on the fly), skills, MCP servers, permission switches, and Run.
-7. **Runs** — live event stream over SSE, approval prompts, the permission audit trail, and
-   the resolved session options for every past run.
+6. **Workflows** — a graph of roles on a draggable canvas: drag nodes to arrange them,
+   drag from a node's handle onto another node (or onto `END`) to connect, click anything
+   to edit it in the inspector. Each edge shows its condition on the graph; an edge that
+   leaves a branching node without one turns red and reads "needs a condition", and
+   creating a branch opens straight into that field. An edge back to an earlier node is a
+   loop. A task runs either a team or a workflow.
+7. **Tasks** — prompt, project path (validated live), a team (existing or defined inline,
+   including roles created on the fly) *or* a workflow, skills, MCP servers, permission
+   switches, and Run.
+8. **Runs** — live event stream over SSE, approval prompts, the permission audit trail, the
+   path a workflow walked, and the resolved session options for every past run.
+
+## How a workflow runs
+
+A team is one session with the lead delegating. A workflow is a state machine the harness
+walks, following LangGraph's superstep model (`docs/example_graph.py` is the reference
+shape, and ships as the "Software team" example):
+
+- A **frontier** of nodes is active at once. Everything in it runs concurrently, then their
+  successors are unioned and deduplicated. **That union is the join**: three roles all
+  pointing at one review node make it run once, after all three finish.
+- A node with several **unconditional** edges fans out — every arm runs in parallel. A node
+  with **conditional** edges branches, decided by a tool-less query constrained to that
+  node's own edge labels; it may select several, which is how only the roles with problems
+  re-run. Mixing the two out of one node is rejected as ambiguous.
+- Each step files its result under a **named output** (`arch_doc`, `code`, …) and later
+  steps are handed those artifacts by name. The router can attach **feedback per target**,
+  so a role reworking sees the notes meant for it.
+- Loops are bounded twice — per-node visit budget and the workflow's superstep budget. A
+  workflow can name an **escalation node** to hand over to when a budget runs out instead
+  of failing, and an edge can **reset** visit budgets when it sends work back upstream.
+- Each visit to a node is **its own session**, built through the same options builder as a
+  flat run — so a step is never configured more loosely, and gets no subagents.
+- Graphs are validated before they can be saved: no unreachable nodes, no undecidable
+  branches, no two nodes writing the same output name, and no graph that can never finish.
 
 ## How the chat assistant is confined
 
