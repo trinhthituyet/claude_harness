@@ -1012,13 +1012,16 @@ enum of that node's own edge labels, so the answer is always one of the graph's 
 Verified live; the recorded reasoning is genuinely good, e.g. *"the checker never ran to
 completion, so this falls under rework."*
 
-Two measured details in the router, both counter-intuitive:
+Two measured details, one of which was a bug of mine:
 
-- **`hooks=None` is required.** With a `PreToolUse` hook registered, the CLI returns an
-  *empty* structured result and routing silently falls back to the default. Bisected
-  across seven option variants. Dropping the hook costs nothing — the router session has
-  no tools for it to fire on — and `can_use_tool` stays, because removing *that* instead
-  produced `error_max_structured_output_retries`.
+- **Structured output is delivered by a `StructuredOutput` tool call.** My gate was
+  denying it under the fail-closed unknown-tool rule, so the structured channel came back
+  empty with no obvious cause — the model's own text said so: *"the StructuredOutput tool
+  is being rejected by the harness (not on the allow table)"*. I first mis-diagnosed this
+  as "a registered `PreToolUse` hook breaks structured output" and worked around it by
+  dropping the hook in the router, which weakened the boundary for no reason. The real fix
+  is one line: `StructuredOutput` is on the tool table as having no filesystem effect, and
+  the gate's hook now stays registered everywhere.
 - **`max_turns=1` is not enough** for structured output through a client session, though
   it is through the one-shot `query()` helper. The router allows 4.
 
@@ -1033,6 +1036,78 @@ a different default would have looped wrongly.
 workflow that ran out of budget did not reach its goal. This is not theoretical: in one
 live run Bash was unavailable, the reviewer could never confirm success, and
 `max_visits` was what ended it.
+
+### 5b.3b Per-node output shapes
+
+A node may declare a **JSON Schema** its result must match — the equivalent of the
+example's `with_structured_output(ReviewResult)`. With one set, the step runs with
+`output_format` and its artifact becomes the structured object; later steps and the router
+are shown that JSON, labelled `(JSON)`, rather than prose. Without one, the step produces
+free-form text as before.
+
+Verified live: the example's `review` step returned
+`{approved, architect_issues, designer_issues, tester_issues, summary}` and `pm` returned
+`{code_ok, failure_type, feedback}`, with the gate's hook fully in place.
+
+Three decisions worth stating:
+
+- **Schemas must be an object with named properties.** A bare string or top-level array
+  gives later steps nothing to read by name, which is the whole point of declaring one.
+  Unsupported keywords are rejected rather than passed through to fail opaquely in the CLI.
+- **A step that ignores its schema is reported, not hidden.** The structured channel is
+  tried first, then JSON embedded in the prose; if neither yields an object the run emits
+  `schema_unsatisfied`, keeps the prose so the run stays useful, and carries on. Failing
+  the whole run over a malformed result would be worse; hiding it would be worse still,
+  because whatever reads those fields would then see nothing.
+- **A structured step may produce no prose at all.** One live review step returned
+  `chars: 0` with a valid object — so `StepResult.rendered` falls back to the JSON, and
+  nothing downstream sees an empty artifact.
+
+### 5b.3c Expression conditions, and choosing a step's inputs
+
+Once steps emit JSON, two things follow naturally.
+
+**An edge can test the result instead of asking a model.** `app/services/expr.py` is a
+small expression language — `issues contains architecture`, `approved is false`,
+`score > 5`, joined with `and`/`or`/`not`, dotted paths reaching into nested objects and
+other artifacts (`review_notes.approved`). It is deterministic, instant and free.
+
+Routing precedence, and why:
+
+1. All edges unconditional → fan out.
+2. **Every edge carrying an expression is evaluated.** If any matched, that *is* the
+   answer — the model is not consulted at all. Several may match, which fans out.
+3. If nothing matched and some edges are described in words, the model chooses among
+   *those*. If none are, the default edge is taken.
+
+So a graph can mix mechanical branches with judgemental ones, and the mechanical ones
+never cost a call. Verified live: the review node's four edges came back as
+`["arch_issues=false", "design_issues=true", "test_issues=false", "approved=false"]` →
+`matched: ["design_issues"]`, with the reason recorded on the edge as
+`matched design_issues (designer_issues is not empty)`.
+
+Three semantics chosen deliberately, each pinned by tests:
+
+- **`contains` is forgiving**, because the data is model-written prose. On a string it is a
+  case-insensitive substring test; on a list it matches an element outright *or* any string
+  element containing the operand; on an object it tests for a key. That is what makes
+  `issues contains architecture` match `["architecture is wrong: the parser owns too much"]`.
+- **A bare word beside an operator is the word itself when it names nothing in scope.**
+  Otherwise the motivating example could not work — there is no `architecture` field. The
+  same rule on either side makes `architect in counts` read correctly. But a bare word used
+  **alone** (truthiness, `is empty`) is only ever a field path, or every typo would become
+  a truthy string.
+- **A missing path is false, not an error** — except under `!=`, where something absent
+  genuinely is not that value. An expression that fails to *parse* is a different matter: it
+  emits `condition_error` rather than silently never firing.
+
+**A node can select its inputs.** `inputs` is a list of `{from, path, as}`: `from` names an
+artifact, `path` pulls one field out of it, `as` labels it in the prompt. With none set a
+step sees every artifact, which is right for a small graph. With them set it sees only
+those — so in the shipped example each role re-running gets
+`review_notes.architect_issues` as `my_review_notes` and not the other roles' notes or the
+review's verdict. An input naming an artifact nothing writes is rejected at save time,
+because a typo would otherwise hand the step nothing at all and look like a model failure.
 
 ### 5b.4 Editor: a draggable canvas
 

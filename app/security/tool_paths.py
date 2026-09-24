@@ -42,6 +42,10 @@ TOOL_TABLE: dict[str, ToolSpec] = {
     "WebFetch": ToolSpec("network"),
     "WebSearch": ToolSpec("network"),
     # --- no filesystem effect ---
+    #: How the CLI delivers a structured result when ``output_format`` is set. It writes
+    #: nothing and reads nothing; denying it (as the fail-closed default did) makes the
+    #: structured channel come back empty with no obvious cause.
+    "StructuredOutput": ToolSpec("meta"),
     "TodoWrite": ToolSpec("meta"),
     "Skill": ToolSpec("meta"),
     "Task": ToolSpec("meta"),

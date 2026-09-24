@@ -228,3 +228,102 @@ def test_an_escalation_node_may_be_reachable_only_by_escalation():
 def test_an_edge_resetting_an_unknown_node_is_rejected():
     with pytest.raises(GraphError, match="resets unknown nodes"):
         validate(nodes("a"), [edge("a", None, "done", resets=("ghost",))])
+
+
+# ------------------------------------------------------------- output schemas
+
+
+def test_a_usable_output_schema_is_accepted():
+    from app.services.graph import validate_output_schema
+
+    assert validate_output_schema({
+        "type": "object",
+        "properties": {
+            "approved": {"type": "boolean"},
+            "issues": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string", "description": "one line"},
+        },
+        "required": ["approved", "issues"],
+        "additionalProperties": False,
+    }) == []
+
+
+def test_a_nested_object_schema_is_accepted():
+    """The example graph's Issues model: per-role lists inside one object."""
+    from app.services.graph import validate_output_schema
+
+    assert validate_output_schema({
+        "type": "object",
+        "properties": {
+            "issues": {
+                "type": "object",
+                "properties": {
+                    "architect": {"type": "array", "items": {"type": "string"}},
+                    "designer": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    }) == []
+
+
+def test_an_enum_field_is_accepted():
+    """PMReport.failure_type is a literal set."""
+    from app.services.graph import validate_output_schema
+
+    assert validate_output_schema({
+        "type": "object",
+        "properties": {
+            "failure_type": {"type": "string",
+                             "enum": ["none", "code_bug", "arch_issue"]},
+        },
+    }) == []
+
+
+def test_a_non_object_schema_is_rejected():
+    from app.services.graph import validate_output_schema
+
+    problems = validate_output_schema({"type": "string"})
+    assert any("must be" in p for p in problems)
+
+
+def test_an_empty_schema_is_rejected():
+    from app.services.graph import validate_output_schema
+
+    assert validate_output_schema({}) != []
+
+
+def test_a_property_without_a_type_is_rejected():
+    from app.services.graph import validate_output_schema
+
+    assert any("needs a \"type\"" in p for p in
+               validate_output_schema({"type": "object", "properties": {"a": {}}}))
+
+
+def test_an_array_without_items_is_rejected():
+    from app.services.graph import validate_output_schema
+
+    problems = validate_output_schema(
+        {"type": "object", "properties": {"a": {"type": "array"}}})
+    assert any("without \"items\"" in p for p in problems)
+
+
+def test_required_naming_a_missing_property_is_rejected():
+    from app.services.graph import validate_output_schema
+
+    problems = validate_output_schema(
+        {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["b"]})
+    assert any("do not exist" in p for p in problems)
+
+
+def test_unsupported_keywords_are_rejected():
+    """Silently passing them through would fail later, in the CLI, with no clue why."""
+    from app.services.graph import validate_output_schema
+
+    problems = validate_output_schema(
+        {"type": "object", "properties": {"a": {"type": "string", "pattern": "^x"}}})
+    assert any("unsupported keywords" in p for p in problems)
+
+
+def test_a_node_schema_is_checked_by_validate():
+    with pytest.raises(GraphError, match="output schema"):
+        validate([NodeSpec("a", True, output_schema={"type": "string"})], [])

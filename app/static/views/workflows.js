@@ -1,6 +1,6 @@
 import { api, checkbox, confirmDelete, el, emptyState, field, mount, toast } from "../lib.js";
-import { END, fansOut, interactiveCanvas, needsCondition, siblingsOf, staticDiagram }
-  from "./graph.js";
+import { END, fansOut, interactiveCanvas, needsCondition, parseSchemaText, siblingsOf,
+  staticDiagram } from "./graph.js";
 
 export async function render(panel, arg) {
   const [workflows, roles, examples] = await Promise.all([
@@ -102,12 +102,14 @@ function editor(editing, roles, examples, panel) {
         key: n.key, role_id: n.role_id, instructions: n.instructions || "",
         is_start: !!n.is_start, max_visits: n.max_visits || 3,
         output_key: n.output_key || n.key,
+        output_schema: n.output_schema ?? null,
+        inputs: n.inputs || [],
         pos_x: n.pos_x ?? null, pos_y: n.pos_y ?? null,
       })),
       edges: state.edges.map((e) => ({
         from_key: e.from_key, to_key: e.to_key, label: e.label,
-        condition: e.condition || "", is_default: !!e.is_default,
-        resets: e.resets || [],
+        condition: e.condition || "", expression: e.expression || "",
+        is_default: !!e.is_default, resets: e.resets || [],
       })),
     };
   }
@@ -158,7 +160,7 @@ function editor(editing, roles, examples, panel) {
         el("option", { value: n.key, selected: n.key === current }, n.key)));
   }
 
-  function redraw() {
+  function redraw({ inspector: rebuildInspector = true } = {}) {
     refreshEscalation();
     // Role names are denormalised onto the nodes the canvas draws. Assigning onto the
     // same objects keeps state.nodes and the canvas looking at one set of nodes, so a
@@ -174,7 +176,9 @@ function editor(editing, roles, examples, panel) {
       onDelete: (selection) => removeSelected(selection),
     });
     mount(canvasHost, canvas.element);
-    drawInspector();
+    // Editing a field must not recreate the inspector underneath the cursor: that is
+    // what discarded half-typed JSON before.
+    if (rebuildInspector) drawInspector();
     clearTimeout(validateTimer);
     validateTimer = setTimeout(revalidate, 250);
   }
@@ -271,10 +275,117 @@ function editor(editing, roles, examples, panel) {
       value: node.output_key || node.key,
       placeholder: node.key,
     });
+    // The raw text lives on the node so a partially-typed schema survives anything
+    // that repaints. Only valid JSON is promoted to node.output_schema.
+    if (node.schema_text === undefined) {
+      node.schema_text = node.output_schema
+        ? JSON.stringify(node.output_schema, null, 2)
+        : "";
+    }
+    const schemaText = el("textarea", {
+      rows: 10, spellcheck: "false",
+      value: node.schema_text,
+      placeholder: '{\n  "type": "object",\n  "properties": {\n'
+        + '    "approved": { "type": "boolean" },\n'
+        + '    "issues": { "type": "array", "items": { "type": "string" } }\n'
+        + '  },\n  "required": ["approved"]\n}',
+    });
+    const schemaState = el("div", { class: "path-state" }, "");
+    const summaryLabel = el("span", {}, "Output shape");
+
+    // Inputs: which earlier artifacts (or one of their fields) this step is shown.
+    const inputsList = el("div", {});
+    const sources = state.nodes
+      .filter((n) => n !== node)
+      .map((n) => ({ name: n.output_key || n.key, node: n }));
+    const newFrom = el("select", {}, sources.map((srcObj) =>
+      el("option", { value: srcObj.name }, srcObj.name)));
+    const newPath = el("input", { placeholder: "issues (optional)" });
+    const newAs = el("input", { placeholder: "label (optional)" });
+
+    function drawInputs() {
+      const inputs = node.inputs || [];
+      mount(inputsList, ...(inputs.length
+        ? inputs.map((input, index) =>
+            el("div", { class: "card-head" },
+              el("span", { class: "mono" },
+                `${input.from}${input.path ? `.${input.path}` : ""}`
+                + (input.as ? ` → ${input.as}` : "")),
+              el("div", { class: "card-actions" },
+                el("button", {
+                  class: "btn danger", type: "button",
+                  onclick: () => {
+                    node.inputs.splice(index, 1);
+                    drawInputs();
+                    redraw({ inspector: false });
+                  },
+                }, "Remove"))))
+        : [el("p", { class: "sub" },
+            "Nothing selected: this step sees every artifact produced so far.")]));
+    }
+
+    const addInput = el("button", {
+      class: "btn ghost", type: "button",
+      onclick: () => {
+        if (!sources.length) { toast("There are no other steps to take input from", true); return; }
+        node.inputs = node.inputs || [];
+        node.inputs.push({
+          from: newFrom.value,
+          path: newPath.value.trim(),
+          as: newAs.value.trim(),
+        });
+        newPath.value = ""; newAs.value = "";
+        drawInputs();
+        redraw({ inspector: false });
+      },
+    }, "Add input");
+    drawInputs();
+    const schemaTemplate = el("button", {
+      class: "btn ghost", type: "button",
+      onclick: () => {
+        schemaText.value = JSON.stringify({
+          type: "object",
+          properties: {
+            approved: { type: "boolean" },
+            issues: { type: "array", items: { type: "string" } },
+            summary: { type: "string" },
+          },
+          required: ["approved", "issues"],
+          additionalProperties: false,
+        }, null, 2);
+        applySchema();
+        schemaText.focus();
+      },
+    }, "Insert a starting schema");
+
+    function applySchema() {
+      // Always keep the text, whatever state it is in.
+      node.schema_text = schemaText.value;
+      const result = parseSchemaText(schemaText.value);
+      if (result.schema !== undefined) node.output_schema = result.schema;
+      schemaState.className = `path-state ${result.ok ? (result.schema ? "ok" : "") : "bad"}`;
+      schemaState.textContent = result.message;
+      summaryLabel.textContent = node.output_schema
+        ? `Output shape: JSON — ${result.fields.join(", ") || "no fields yet"}`
+        : "Output shape: free text — click to define a JSON result";
+      return result.ok;
+    }
+    // Parse as it is typed, so the feedback is immediate and nothing is rebuilt.
+    let schemaTimer = null;
+    schemaText.addEventListener("input", () => {
+      clearTimeout(schemaTimer);
+      schemaTimer = setTimeout(() => {
+        applySchema();
+        clearTimeout(validateTimer);
+        validateTimer = setTimeout(revalidate, 400);
+      }, 250);
+    });
+    applySchema();
     const start = checkbox("Start node", "is_start", node.is_start,
       "Where a run begins. Only one node can be the start.");
 
     function apply() {
+      let keyChanged = false;
       const nextKey = keyInput.value.trim().toLowerCase();
       if (nextKey && nextKey !== node.key) {
         if (state.nodes.some((n) => n !== node && n.key === nextKey)) {
@@ -289,6 +400,7 @@ function editor(editing, roles, examples, panel) {
           }
           node.key = nextKey;
           state.selection = { kind: "node", key: nextKey };
+          keyChanged = true;
         }
       }
       node.role_id = Number(roleSelect.value);
@@ -296,6 +408,7 @@ function editor(editing, roles, examples, panel) {
       node.max_visits = Number(visits.value) || 1;
       const artifact = outputKey.value.trim().toLowerCase();
       node.output_key = artifact || node.key;
+      applySchema();
       if (start.input.checked) {
         for (const other of state.nodes) other.is_start = other === node;
       } else if (node.is_start) {
@@ -303,7 +416,7 @@ function editor(editing, roles, examples, panel) {
         start.input.checked = true;
         toast("A workflow needs a start node — make another node the start instead", true);
       }
-      redraw();
+      redraw({ inspector: keyChanged });
     }
 
     for (const control of [keyInput, roleSelect, instructions, visits, outputKey,
@@ -327,6 +440,28 @@ function editor(editing, roles, examples, panel) {
         "What later steps see this step's result as — e.g. arch_doc, design_doc, code."),
       field("Step instructions", instructions,
         "Added to the role's own system prompt for this step only."),
+      el("details", { class: "editor", open: (node.inputs || []).length > 0 },
+        el("summary", {},
+          (node.inputs || []).length
+            ? `Inputs: ${node.inputs.map((i) => i.from + (i.path ? "." + i.path : "")).join(", ")}`
+            : "Inputs — everything produced so far"),
+        el("p", { class: "sub" },
+          "Pick what this step is shown. A path pulls one field out of a JSON result, so "
+          + "a role reworking sees only the notes addressed to it."),
+        inputsList,
+        el("div", { class: "row" },
+          field("From", newFrom),
+          field("Field path", newPath, "Optional. e.g. issues, or counts.architect"),
+          field("Call it", newAs),
+          el("div", {}, addInput))),
+      el("details", { class: "editor", open: !!node.output_schema },
+        el("summary", {}, summaryLabel),
+        el("p", { class: "sub" },
+          "Leave empty for prose. Give a JSON Schema and this step must return data "
+          + "matching it; later steps and the router then read its fields by name."),
+        field("JSON Schema", schemaText),
+        schemaState,
+        el("div", {}, schemaTemplate)),
       start.label);
   }
 
@@ -347,6 +482,12 @@ function editor(editing, roles, examples, panel) {
     });
     const isDefault = checkbox("Default edge", "is_default", edge.is_default,
       "Taken when no condition matches. At most one per source node.");
+    const expression = el("input", {
+      value: edge.expression || "",
+      placeholder: "issues contains architecture",
+      spellcheck: "false",
+    });
+    const expressionState = el("div", { class: "path-state" }, "");
     const resetsSelect = el("select", {
       multiple: true, size: Math.min(4, Math.max(2, state.nodes.length)),
     }, state.nodes.map((n) =>
@@ -367,7 +508,9 @@ function editor(editing, roles, examples, panel) {
       }
       edge.to_key = targets.value === END ? null : targets.value;
       edge.condition = condition.value;
+      edge.expression = expression.value.trim();
       edge.resets = [...resetsSelect.selectedOptions].map((o) => o.value);
+      describeExpression();
       if (isDefault.input.checked) {
         for (const other of state.edges) {
           if (other.from_key === edge.from_key) other.is_default = other === edge;
@@ -375,12 +518,41 @@ function editor(editing, roles, examples, panel) {
       } else {
         edge.is_default = false;
       }
-      redraw();
+      redraw({ inspector: false });
     }
 
-    for (const control of [labelInput, targets, condition, isDefault.input, resetsSelect]) {
+    for (const control of [labelInput, targets, condition, expression, isDefault.input,
+                           resetsSelect]) {
       control.addEventListener("change", apply);
     }
+
+    // Which JSON fields are on offer here: the source step's own schema, plus every
+    // artifact by name. Without this you are guessing at field names.
+    const source = state.nodes.find((n) => n.key === edge.from_key);
+    const ownFields = Object.keys(source?.output_schema?.properties || {});
+    const artifacts = state.nodes
+      .filter((n) => n.output_schema)
+      .map((n) => n.output_key || n.key);
+
+    function describeExpression() {
+      const text = expression.value.trim();
+      if (!text) {
+        expressionState.className = "path-state";
+        expressionState.textContent = ownFields.length
+          ? `Available here: ${ownFields.join(", ")}`
+          : source?.output_schema
+            ? "The source step has no fields yet."
+            : `${edge.from_key} returns prose, so there are no fields to test — `
+              + "give it an output shape first, or use a worded condition.";
+        return;
+      }
+      expressionState.className = "path-state ok";
+      expressionState.textContent = ownFields.length
+        ? `Reads: ${ownFields.join(", ")}${artifacts.length ? ` · also ${artifacts.join(", ")}` : ""}`
+        : "No declared fields on the source step — this will not match anything.";
+    }
+    expression.addEventListener("input", describeExpression);
+    describeExpression();
 
     return el("div", {},
       el("div", { class: "card-head" },
@@ -407,6 +579,16 @@ function editor(editing, roles, examples, panel) {
             ? "Required: this node branches, so every edge needs a condition — or must be "
               + "the default, which is taken when no condition matches."
             : "Optional while this is the only way out of " + edge.from_key + "."),
+      el("details", { class: "editor", open: !!edge.expression },
+        el("summary", {},
+          edge.expression ? `Test: ${edge.expression}` : "Test the result instead (no model call)"),
+        el("p", { class: "sub" },
+          "A deterministic test over the source step's JSON result — e.g. "
+          + "\u201cissues contains architecture\u201d, \u201capproved is false\u201d, "
+          + "\u201cscore > 5\u201d. When any expression on this node matches, the model is "
+          + "not consulted at all."),
+        field("Expression", expression),
+        expressionState),
       isDefault.label,
       field("Reset visit budgets", resetsSelect,
         "Nodes whose visit counts start again when this edge is taken — for sending work "
@@ -464,10 +646,13 @@ function editor(editing, roles, examples, panel) {
           key: n.key, role_id: keyed[n.key], instructions: n.instructions || "",
           is_start: !!n.is_start, max_visits: n.max_visits || 3,
           output_key: n.output_key || n.key,
+          output_schema: n.output_schema || null,
+          inputs: n.inputs || [],
           pos_x: 30 + index * 230, pos_y: 30,
         }));
         state.edges = example.edges.map((e) => ({
-          ...e, condition: e.condition || "", resets: e.resets || [],
+          ...e, condition: e.condition || "", expression: e.expression || "",
+          resets: e.resets || [],
         }));
         state.selection = null;
         redraw();

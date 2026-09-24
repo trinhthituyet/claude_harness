@@ -497,3 +497,196 @@ async def test_two_nodes_writing_the_same_artifact_is_rejected(client):
     })
     assert response.status_code == 422
     assert "same output name" in response.text
+
+
+# ------------------------------------------------------ per-node output schemas
+
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "approved": {"type": "boolean"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "string"},
+    },
+    "required": ["approved", "summary"],
+    "additionalProperties": False,
+}
+
+
+async def test_a_node_output_schema_round_trips(client):
+    role = await make_role(client, "Reviewer")
+    created = await client.post("/api/workflows", json={
+        "name": "structured",
+        "nodes": [{"key": "review", "role_id": role, "is_start": True,
+                   "output_key": "verdict", "output_schema": REVIEW_SCHEMA}],
+        "edges": [],
+    })
+    assert created.status_code == 201, created.text
+    node = created.json()["nodes"][0]
+    assert node["output_schema"] == REVIEW_SCHEMA
+    assert node["output_key"] == "verdict"
+
+    reread = (await client.get(f"/api/workflows/{created.json()['id']}")).json()
+    assert reread["nodes"][0]["output_schema"]["properties"]["approved"]["type"] == "boolean"
+
+
+async def test_a_node_without_a_schema_returns_null(client):
+    role = await make_role(client, "Any")
+    created = await client.post("/api/workflows", json={
+        "name": "prose", "nodes": [{"key": "a", "role_id": role}], "edges": [],
+    })
+    assert created.json()["nodes"][0]["output_schema"] is None
+
+
+async def test_an_unusable_output_schema_is_rejected(client):
+    role = await make_role(client, "Any")
+    response = await client.post("/api/workflows", json={
+        "name": "bad schema",
+        "nodes": [{"key": "a", "role_id": role, "output_schema": {"type": "string"}}],
+        "edges": [],
+    })
+    assert response.status_code == 422
+    assert "output schema" in response.text
+
+
+async def test_a_schema_with_an_untyped_field_is_rejected(client):
+    role = await make_role(client, "Any")
+    response = await client.post("/api/workflows", json={
+        "name": "untyped",
+        "nodes": [{"key": "a", "role_id": role,
+                   "output_schema": {"type": "object", "properties": {"x": {}}}}],
+        "edges": [],
+    })
+    assert response.status_code == 422
+    # The body is JSON, so the quotes in the message arrive escaped.
+    assert "needs a" in response.text and "type" in response.text
+
+
+async def test_the_validate_endpoint_reports_schema_problems(client):
+    role = await make_role(client, "Any")
+    result = (await client.post("/api/workflows/validate", json={
+        "name": "draft",
+        "nodes": [{"key": "a", "role_id": role,
+                   "output_schema": {"type": "object", "properties": {}}}],
+        "edges": [],
+    })).json()
+    assert result["ok"] is False
+    assert any("properties" in p for p in result["problems"])
+
+
+async def test_the_shipped_example_carries_schemas(client):
+    """The example's review and pm steps mirror ReviewResult and PMReport."""
+    examples = (await client.get("/api/workflows/examples")).json()
+    team = next(e for e in examples if e["name"] == "Software team")
+    by_key = {n["key"]: n for n in team["nodes"]}
+    assert by_key["review"]["output_schema"]["properties"]["approved"]["type"] == "boolean"
+    failure = by_key["pm"]["output_schema"]["properties"]["failure_type"]
+    assert "code_bug" in failure["enum"]
+
+
+# ----------------------------------------- expression conditions and node inputs
+
+
+async def test_an_expression_edge_round_trips(client):
+    """The motivating case, stored and read back."""
+    role = await make_role(client, "Reviewer")
+    created = await client.post("/api/workflows", json={
+        "name": "expr",
+        "nodes": [
+            {"key": "review", "role_id": role, "is_start": True,
+             "output_key": "review_notes",
+             "output_schema": {"type": "object", "properties": {
+                 "approved": {"type": "boolean"},
+                 "issues": {"type": "array", "items": {"type": "string"}}}}},
+            {"key": "architect", "role_id": role},
+        ],
+        "edges": [
+            {"from_key": "review", "to_key": "architect", "label": "arch_issues",
+             "expression": "issues contains architecture"},
+            {"from_key": "review", "to_key": None, "label": "approved",
+             "expression": "approved is true", "is_default": True},
+            {"from_key": "architect", "to_key": "review", "label": "back"},
+        ],
+    })
+    assert created.status_code == 201, created.text
+    by_label = {e["label"]: e for e in created.json()["edges"]}
+    assert by_label["arch_issues"]["expression"] == "issues contains architecture"
+    assert by_label["arch_issues"]["condition"] == ""
+
+
+async def test_an_expression_satisfies_the_branch_rule(client):
+    """An expression describes the edge, so a branch needs no worded condition."""
+    role = await make_role(client, "Any")
+    response = await client.post("/api/workflows", json={
+        "name": "expr branch",
+        "nodes": [{"key": "a", "role_id": role, "is_start": True},
+                  {"key": "b", "role_id": role}, {"key": "c", "role_id": role}],
+        "edges": [{"from_key": "a", "to_key": "b", "label": "x",
+                   "expression": "score > 5"},
+                  {"from_key": "a", "to_key": "c", "label": "y", "is_default": True},
+                  {"from_key": "b", "to_key": None, "label": "done"},
+                  {"from_key": "c", "to_key": None, "label": "done"}],
+    })
+    assert response.status_code == 201, response.text
+
+
+async def test_an_unparseable_expression_is_rejected_with_the_reason(client):
+    role = await make_role(client, "Any")
+    response = await client.post("/api/workflows", json={
+        "name": "bad expr",
+        "nodes": [{"key": "a", "role_id": role, "is_start": True}],
+        "edges": [{"from_key": "a", "to_key": None, "label": "x",
+                   "expression": "issues contains"}],
+    })
+    assert response.status_code == 422
+    assert "expression" in response.text and "right-hand side" in response.text
+
+
+async def test_node_inputs_round_trip(client):
+    role = await make_role(client, "Any")
+    created = await client.post("/api/workflows", json={
+        "name": "inputs",
+        "nodes": [
+            {"key": "review", "role_id": role, "is_start": True,
+             "output_key": "review_notes"},
+            {"key": "architect", "role_id": role,
+             "inputs": [{"from": "review_notes", "path": "issues", "as": "my_notes"}]},
+        ],
+        "edges": [{"from_key": "review", "to_key": "architect", "label": "next"},
+                  {"from_key": "architect", "to_key": None, "label": "done"}],
+    })
+    assert created.status_code == 201, created.text
+    architect = next(n for n in created.json()["nodes"] if n["key"] == "architect")
+    assert architect["inputs"] == [
+        {"from": "review_notes", "path": "issues", "as": "my_notes"}
+    ]
+
+
+async def test_an_input_from_an_unknown_artifact_is_rejected(client):
+    """A typo in a source name would otherwise silently hand the step nothing."""
+    role = await make_role(client, "Any")
+    response = await client.post("/api/workflows", json={
+        "name": "bad input",
+        "nodes": [{"key": "a", "role_id": role, "is_start": True},
+                  {"key": "b", "role_id": role,
+                   "inputs": [{"from": "reviewnotes", "path": "issues"}]}],
+        "edges": [{"from_key": "a", "to_key": "b", "label": "next"},
+                  {"from_key": "b", "to_key": None, "label": "done"}],
+    })
+    assert response.status_code == 422
+    assert "which no node writes" in response.text
+
+
+async def test_an_input_may_name_the_producing_nodes_own_key(client):
+    """With no output_key, a node's artifact is its key, so that is a valid source."""
+    role = await make_role(client, "Any")
+    response = await client.post("/api/workflows", json={
+        "name": "key as source",
+        "nodes": [{"key": "design", "role_id": role, "is_start": True},
+                  {"key": "build", "role_id": role,
+                   "inputs": [{"from": "design"}]}],
+        "edges": [{"from_key": "design", "to_key": "build", "label": "next"},
+                  {"from_key": "build", "to_key": None, "label": "done"}],
+    })
+    assert response.status_code == 201, response.text

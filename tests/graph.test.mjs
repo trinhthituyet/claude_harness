@@ -6,8 +6,8 @@
 // placed them, how a condition is wrapped for drawing, and which edges the canvas must
 // flag as undecidable. The pointer interactions need a real browser and are not here.
 
-import { conditionLines, fansOut, needsCondition, positionsOf, siblingsOf, BOX_W }
-  from "../app/static/views/graph.js";
+import { conditionLines, fansOut, needsCondition, parseSchemaText, positionsOf,
+  siblingsOf, BOX_W } from "../app/static/views/graph.js";
 
 let failures = 0;
 const results = [];
@@ -134,6 +134,69 @@ const blank = [
 ];
 check("whitespace does not count as a condition", needsCondition(blank, blank[0]) === true);
 check("whitespace does not make a fan-out either", fansOut(blank, "a") === false);
+
+// --------------------------------------------------------- output shape editing
+
+group("output shape");
+
+let shape = parseSchemaText("");
+check("empty text means prose", shape.ok && shape.schema === null, shape.message);
+check("empty text says so", shape.message.includes("prose"));
+
+shape = parseSchemaText("   \n  ");
+check("whitespace also means prose", shape.schema === null);
+
+// Half-typed JSON must not wipe the last good schema: `schema` is left undefined so
+// the caller keeps what it had, while the text the user sees is untouched.
+shape = parseSchemaText('{"type": "object", "properti');
+check("half-typed JSON is not ok", shape.ok === false);
+check("half-typed JSON leaves the schema alone", shape.schema === undefined);
+check("half-typed JSON explains itself", shape.message.startsWith("✗"), shape.message);
+
+shape = parseSchemaText('{"type":"object","properties":{"approved":{"type":"boolean"}}}');
+check("valid JSON is parsed", shape.ok && shape.schema.type === "object");
+check("its fields are listed", shape.fields.join(",") === "approved", shape.message);
+check("the message names the fields", shape.message.includes("approved"));
+
+shape = parseSchemaText(
+  '{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}');
+check("several fields are counted", shape.message.includes("2 fields"), shape.message);
+
+shape = parseSchemaText('{"type":"object"}');
+check("valid JSON with no properties is still ok to keep typing", shape.ok === true);
+check("but it says there are no properties yet",
+  shape.message.includes("no properties"), shape.message);
+
+shape = parseSchemaText('{"type":"object","properties":{}}');
+check("an empty properties object reports no fields", shape.fields.length === 0);
+
+// ------------------------------------------------- expression edges on canvas
+
+group("expression edges");
+
+const exprBranch = [
+  { from_key: "review", label: "arch", condition: "", expression: "issues contains architecture" },
+  { from_key: "review", label: "ok", condition: "", expression: "approved is true" },
+];
+check("an expression describes the edge, so nothing is flagged",
+  needsCondition(exprBranch, exprBranch[0]) === false);
+check("two described edges are not a fan-out", fansOut(exprBranch, "review") === false);
+
+const exprPlusWorded = [
+  { from_key: "a", label: "x", condition: "", expression: "score > 5" },
+  { from_key: "a", label: "y", condition: "it looks wrong" },
+];
+check("an expression and a worded condition can coexist on a node",
+  needsCondition(exprPlusWorded, exprPlusWorded[0]) === false
+  && needsCondition(exprPlusWorded, exprPlusWorded[1]) === false);
+
+const exprPlusBare = [
+  { from_key: "a", label: "x", condition: "", expression: "score > 5" },
+  { from_key: "a", label: "y", condition: "" },
+];
+check("a bare edge beside an expression is still flagged",
+  needsCondition(exprPlusBare, exprPlusBare[1]) === true);
+check("and that node is not a fan-out", fansOut(exprPlusBare, "a") === false);
 
 // ----------------------------------------------------------------- reporting
 

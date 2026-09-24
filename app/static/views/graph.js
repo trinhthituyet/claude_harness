@@ -77,7 +77,8 @@ export function siblingsOf(edges, edge) {
 /** Several bare edges out of one node: every arm runs, in parallel. */
 export function fansOut(edges, fromKey) {
   const out = edges.filter((e) => e.from_key === fromKey);
-  return out.length > 1 && out.every((e) => !(e.condition || "").trim() && !e.is_default);
+  return out.length > 1 && out.every(
+    (e) => !(e.condition || "").trim() && !(e.expression || "").trim() && !e.is_default);
 }
 
 /**
@@ -89,7 +90,9 @@ export function fansOut(edges, fromKey) {
  * that, and the canvas shows it in red rather than leaving the reason in a validation box.
  */
 export function needsCondition(edges, edge) {
-  if ((edge.condition || "").trim() || edge.is_default) return false;
+  if ((edge.condition || "").trim() || (edge.expression || "").trim() || edge.is_default) {
+    return false;
+  }
   const siblings = siblingsOf(edges, edge);
   if (siblings.length <= 1) return false;
   return !fansOut(edges, edge.from_key);
@@ -156,7 +159,10 @@ function edgeGeometry(from, to, ends) {
 function drawEdgeLabel(edge, geo,
                        { index = null, selected = false, missing = false, parallel = false } = {}) {
   const group = svgEl("g", { class: "g-labelblock" });
-  const lines = conditionLines(edge.condition);
+  // An expression is shown verbatim — it is code, so wrapping it would mislead.
+  const lines = (edge.expression || "").trim()
+    ? [`⚡ ${edge.expression.trim()}`.slice(0, 40)]
+    : conditionLines(edge.condition);
   const caption = edge.label + (edge.is_default ? " *" : "");
   const rendered = missing
     ? [...lines, "needs a condition"]
@@ -184,9 +190,11 @@ function drawEdgeLabel(edge, geo,
       class: missing && i === rendered.length - 1 ? "g-cond missing" : "g-cond",
     }, missing && i === rendered.length - 1 ? line : `"${line}"`));
   }
-  if (edge.condition) {
+  if (edge.condition || edge.expression) {
     const title = svgEl("title");
-    title.textContent = edge.condition;
+    title.textContent = edge.expression
+      ? `${edge.expression}  (evaluated by the harness)`
+      : edge.condition;
     text.append(title);
   }
   group.append(text);
@@ -269,7 +277,7 @@ export function staticDiagram(nodes, edges) {
         : parallel ? "var(--ok)"
         : geo.loop ? "var(--warn)" : "var(--text-dim)",
       "stroke-width": edge.is_default ? 2 : parallel ? 1.8 : 1.4,
-      "stroke-dasharray": edge.condition || parallel ? null : "5 3",
+      "stroke-dasharray": edge.condition || edge.expression || parallel ? null : "5 3",
       "marker-end": geo.loop ? "url(#arrow-loop)" : "url(#arrow)",
     }));
     if (ends) {
@@ -369,7 +377,7 @@ export function interactiveCanvas(model) {
           : parallel ? "var(--ok)"
           : geo.loop ? "var(--warn)" : "var(--text-dim)",
         "stroke-width": selected ? 2.6 : edge.is_default ? 2 : parallel ? 1.8 : 1.4,
-        "stroke-dasharray": edge.condition || parallel ? null : "5 3",
+        "stroke-dasharray": edge.condition || edge.expression || parallel ? null : "5 3",
         "marker-end": selected ? "url(#arrow-sel)"
           : geo.loop ? "url(#arrow-loop)" : "url(#arrow)",
       }));
@@ -508,5 +516,35 @@ export function interactiveCanvas(model) {
       resize();
       draw();
     },
+  };
+}
+
+/**
+ * Interpret what the user has typed into a node's output-shape box.
+ *
+ * Returns `schema: undefined` for text that is not valid JSON *yet*, which the caller
+ * treats as "leave the last good schema alone and keep the text" — a schema is typed
+ * character by character, and every intermediate state is invalid.
+ */
+export function parseSchemaText(text) {
+  const raw = (text || "").trim();
+  if (!raw) {
+    return { ok: true, schema: null, fields: [], message: "Empty: this step returns prose." };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return { ok: false, schema: undefined, fields: [],
+             message: `✗ not valid JSON yet: ${error.message}` };
+  }
+  const fields = Object.keys(parsed?.properties || {});
+  return {
+    ok: true,
+    schema: parsed,
+    fields,
+    message: fields.length
+      ? `✓ ${fields.length} field${fields.length > 1 ? "s" : ""}: ${fields.join(", ")}`
+      : "✓ valid JSON, but no properties yet",
   };
 }

@@ -53,6 +53,10 @@ class WorkflowNodeSpec:
     max_visits: int
     #: What this step's output is filed under, so later steps can name it.
     output_key: str = ""
+    #: JSON Schema this step's result must match. None means free-form prose.
+    output_schema: dict[str, Any] | None = None
+    #: ``(from, path, label)`` per selected input. Empty means "everything so far".
+    inputs: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def artifact(self) -> str:
@@ -68,10 +72,12 @@ class WorkflowEdgeSpec:
     is_default: bool
     #: Node keys whose visit budget resets when this edge is taken.
     resets: tuple[str, ...] = ()
+    #: A deterministic test over the source step's structured result.
+    expression: str = ""
 
     @property
     def conditional(self) -> bool:
-        return bool(self.condition.strip())
+        return bool(self.condition.strip()) or bool(self.expression.strip())
 
 
 @dataclass(frozen=True)
@@ -123,6 +129,10 @@ class WorkflowSpec:
                     "instructions": n.instructions,
                     "max_visits": n.max_visits,
                     "output_key": n.artifact,
+                    "output_schema": n.output_schema,
+                    "inputs": [
+                        {"from": f, "path": p, "as": label} for f, p, label in n.inputs
+                    ],
                 }
                 for n in self.nodes
             ],
@@ -132,6 +142,7 @@ class WorkflowSpec:
                     "to": e.to_key or "END",
                     "label": e.label,
                     "condition": e.condition,
+                    "expression": e.expression,
                     "is_default": e.is_default,
                     "resets": list(e.resets),
                 }
@@ -224,6 +235,18 @@ def _workflow_spec(row) -> WorkflowSpec:
                 is_start=node.is_start,
                 max_visits=node.max_visits,
                 output_key=node.output_key or node.key,
+                output_schema=node.output_schema_json,
+                inputs=tuple(
+                    (
+                        str(i.get("from", "")),
+                        str(i.get("path", "")),
+                        str(i.get("as") or (
+                            f"{i.get('from')}.{i.get('path')}" if i.get("path")
+                            else i.get("from", "")
+                        )),
+                    )
+                    for i in (node.inputs_json or [])
+                ),
             )
             for node in row.nodes
         ),
@@ -236,6 +259,7 @@ def _workflow_spec(row) -> WorkflowSpec:
                 condition=edge.condition,
                 is_default=edge.is_default,
                 resets=tuple(edge.resets_json or []),
+                expression=edge.expression or "",
             )
             for edge in row.edges
             if edge.from_node_id in by_id

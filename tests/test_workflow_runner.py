@@ -7,6 +7,7 @@ docs/example_graph.py, which is the reason the executor works in supersteps at a
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 
@@ -531,3 +532,370 @@ async def test_cancelling_stops_after_the_current_superstep(root):
     outcome = await runner.execute()
     assert visited == ["a"]
     assert outcome.reason == "cancelled"
+
+
+# --------------------------------------------------------- per-node JSON output
+
+
+def schema_node(key: str, schema: dict, **kwargs) -> WorkflowNodeSpec:
+    base = node(key, **kwargs)
+    return dataclasses.replace(base, output_schema=schema)
+
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "approved": {"type": "boolean"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["approved", "issues"],
+}
+
+
+async def test_a_schema_node_asks_for_structured_output(root):
+    workflow = WorkflowSpec(
+        id=1, name="schema", max_steps=5,
+        nodes=(schema_node("review", REVIEW_SCHEMA, is_start=True),), edges=(),
+    )
+    runner, _ = make_runner(root, workflow)
+    captured = {}
+
+    async def fake_run(node_spec, visit, artifacts, feedback):
+        options, _ = runner._options_for(node_spec)
+        if node_spec.output_schema is not None:
+            options = dataclasses.replace(
+                options,
+                output_format={"type": "json_schema", "schema": node_spec.output_schema},
+            )
+        captured["output_format"] = options.output_format
+        # The gate's hook must stay on: structured output is delivered by a tool call
+        # the guard recognises, so there is no reason to drop it.
+        captured["hooks"] = options.hooks
+        return StepResult(node_spec.key, "r", visit, "prose", None, node_spec.artifact,
+                          {"approved": True, "issues": []})
+
+    runner._run_node = fake_run  # type: ignore[method-assign]
+    stub_routing(runner, [])
+    await runner.execute()
+
+    assert captured["output_format"]["schema"] == REVIEW_SCHEMA
+    assert captured["hooks"]["PreToolUse"]
+
+
+async def test_structured_output_is_what_later_steps_see(root):
+    workflow = WorkflowSpec(
+        id=1, name="schema", max_steps=5,
+        nodes=(schema_node("review", REVIEW_SCHEMA, is_start=True, output_key="verdict"),
+               node("engineer")),
+        edges=(edge("review", "engineer", "next"), edge("engineer", None, "done")),
+    )
+    runner, events = make_runner(root, workflow)
+    data = {"approved": False, "issues": ["add() subtracts"]}
+
+    async def fake_run(node_spec, visit, artifacts, feedback):
+        if node_spec.key == "engineer":
+            runner.seen = workflow_runner._step_prompt(
+                runner.snapshot, node_spec, artifacts, feedback
+            )
+            return StepResult(node_spec.key, "e", visit, "built it", None,
+                              node_spec.artifact)
+        return StepResult(node_spec.key, "r", visit, "prose form", None,
+                          node_spec.artifact, data)
+
+    runner._run_node = fake_run  # type: ignore[method-assign]
+    stub_routing(runner, [])
+    outcome_steps = (await runner.execute()).steps
+
+    # The engineer is shown the JSON, labelled as such — not the prose.
+    assert "verdict (JSON)" in runner.seen
+    assert '"approved": false' in runner.seen
+    assert "add() subtracts" in runner.seen
+    # The prose is still on the step, it is just not what downstream reads.
+    assert outcome_steps[0].output == "prose form"
+    assert outcome_steps[0].rendered.startswith("{")
+
+
+def test_structured_falls_back_to_json_in_the_prose(root):
+    """The structured channel can come back empty; the JSON is usually in the text too."""
+    workflow = WorkflowSpec(id=1, name="s", max_steps=2,
+                            nodes=(node("a", is_start=True),), edges=())
+    runner, _ = make_runner(root, workflow)
+    assert runner._structured(None, 'here it is: {"approved": true} done') == {"approved": True}
+    assert runner._structured(None, "no json here") is None
+
+
+async def test_a_node_that_ignores_its_schema_is_reported_not_hidden(root):
+    workflow = WorkflowSpec(
+        id=1, name="schema", max_steps=5,
+        nodes=(schema_node("review", REVIEW_SCHEMA, is_start=True),), edges=(),
+    )
+    runner, events = make_runner(root, workflow)
+
+    async def fake_run(node_spec, visit, artifacts, feedback):
+        # Reproduce _run_node's schema handling with prose that carries no JSON.
+        text = "I reviewed it and it seems fine."
+        data = runner._structured(None, text)
+        if data is None:
+            await runner.bus.emit(
+                "schema_unsatisfied",
+                {"node": node_spec.key, "artifact": node_spec.artifact, "note": "no match"},
+            )
+        return StepResult(node_spec.key, "r", visit, text, None, node_spec.artifact, data)
+
+    runner._run_node = fake_run  # type: ignore[method-assign]
+    stub_routing(runner, [])
+    outcome = await runner.execute()
+
+    assert [t for t, _ in events if t == "schema_unsatisfied"]
+    # The prose is still kept, so the run stays useful.
+    assert outcome.steps[0].output.startswith("I reviewed it")
+    assert outcome.steps[0].data is None
+
+
+def test_a_step_prompt_states_the_required_shape(root):
+    workflow = WorkflowSpec(
+        id=1, name="s", max_steps=2,
+        nodes=(schema_node("review", REVIEW_SCHEMA, is_start=True),), edges=(),
+    )
+    runner, _ = make_runner(root, workflow)
+    prompt = workflow_runner._step_prompt(runner.snapshot, workflow.nodes[0], {}, [])
+    assert "must match this shape" in prompt
+    assert '"approved"' in prompt
+    assert "structured result" in prompt
+
+
+def test_a_plain_node_is_not_asked_for_json(root):
+    workflow = WorkflowSpec(id=1, name="s", max_steps=2,
+                            nodes=(node("a", is_start=True),), edges=())
+    runner, _ = make_runner(root, workflow)
+    prompt = workflow_runner._step_prompt(runner.snapshot, workflow.nodes[0], {}, [])
+    assert "must match this shape" not in prompt
+    assert "stating what you produced" in prompt
+
+
+# ------------------------------------------- expression conditions on edges
+
+
+ISSUES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "approved": {"type": "boolean"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
+def expr_graph() -> WorkflowSpec:
+    """review branches on its own JSON, with no model call in the loop."""
+    return WorkflowSpec(
+        id=1, name="expr", max_steps=10,
+        nodes=(
+            dataclasses.replace(node("review", is_start=True, max_visits=3),
+                                output_key="review_notes", output_schema=ISSUES_SCHEMA),
+            node("architect", max_visits=3),
+            node("engineer", max_visits=3),
+        ),
+        edges=(
+            WorkflowEdgeSpec("review", "architect", "arch_issues", "", False, (),
+                             "issues contains architecture"),
+            WorkflowEdgeSpec("review", "engineer", "approved", "", True, (),
+                             "approved is true"),
+            edge("architect", "review", "back"),
+            edge("engineer", None, "done"),
+        ),
+    )
+
+
+def stub_data_steps(runner: WorkflowRunner, data: dict[str, dict | None]) -> list[str]:
+    """Nodes return canned structured results, in sequence per node key."""
+    visited: list[str] = []
+    queues = {k: list(v) if isinstance(v, list) else [v] for k, v in data.items()}
+
+    async def fake_run_node(node_spec, visit, artifacts, feedback):
+        visited.append(f"{node_spec.key}#{visit}")
+        runner.last_prompt = workflow_runner._step_prompt(
+            runner.snapshot, node_spec, artifacts, feedback
+        )
+        queue = queues.get(node_spec.key) or [None]
+        payload = queue.pop(0) if queue else None
+        return StepResult(node_spec.key, node_spec.role.name, visit,
+                          "prose", None, node_spec.artifact, payload)
+
+    runner._run_node = fake_run_node  # type: ignore[method-assign]
+    return visited
+
+
+async def test_an_expression_routes_without_asking_a_model(root):
+    runner, events = make_runner(root, expr_graph())
+    visited = stub_data_steps(runner, {
+        "review": [{"approved": False, "issues": ["architecture is too coupled"]},
+                   {"approved": True, "issues": []}],
+    })
+
+    async def must_not_be_called(*args, **kwargs):
+        raise AssertionError("the model was asked despite a matching expression")
+
+    # Any model call would go through the SDK; the expressions must settle it first.
+    runner._choose_edges_via_model = must_not_be_called  # type: ignore[attr-defined]
+
+    outcome = await runner.execute()
+    assert visited[:2] == ["review#1", "architect#1"], visited
+    assert outcome.reason == "end"
+
+    evaluated = [p for t, p in events if t == "conditions_evaluated"]
+    assert evaluated[0]["matched"] == ["arch_issues"], evaluated[0]
+    assert "approved=false" in " ".join(evaluated[0]["results"])
+
+
+async def test_the_expression_reads_this_step_and_other_artifacts(root):
+    """`issues contains architecture` reads the current step; a dotted name reads another."""
+    workflow = WorkflowSpec(
+        id=1, name="cross", max_steps=6,
+        nodes=(
+            dataclasses.replace(node("a", is_start=True), output_key="first",
+                                output_schema=ISSUES_SCHEMA),
+            dataclasses.replace(node("b"), output_key="second",
+                                output_schema=ISSUES_SCHEMA),
+            node("c"),
+        ),
+        edges=(
+            edge("a", "b", "to_b"),
+            WorkflowEdgeSpec("b", "c", "earlier_failed", "", False, (),
+                             "first.approved is false"),
+            WorkflowEdgeSpec("b", None, "fine", "", True, (), "first.approved is true"),
+            edge("c", None, "done"),
+        ),
+    )
+    runner, events = make_runner(root, workflow)
+    visited = stub_data_steps(runner, {
+        "a": [{"approved": False, "issues": []}],
+        "b": [{"approved": True, "issues": []}],
+    })
+    outcome = await runner.execute()
+    assert "c#1" in visited, visited
+    matched = [p["matched"] for t, p in events if t == "conditions_evaluated"]
+    assert matched and matched[-1] == ["earlier_failed"]
+    assert outcome.reason == "end"
+
+
+async def test_no_expression_matching_takes_the_default(root):
+    runner, events = make_runner(root, expr_graph())
+    stub_data_steps(runner, {"review": [{"approved": True, "issues": []}]})
+    outcome = await runner.execute()
+    taken = [p["label"] for t, p in events if t == "edge_taken"]
+    assert "approved" in taken, taken
+    assert outcome.reason == "end"
+
+
+async def test_a_broken_expression_is_reported_not_silently_false(root):
+    workflow = WorkflowSpec(
+        id=1, name="broken", max_steps=4,
+        nodes=(dataclasses.replace(node("a", is_start=True), output_schema=ISSUES_SCHEMA),
+               node("b")),
+        edges=(
+            WorkflowEdgeSpec("a", "b", "bad", "", False, (), "issues contains"),
+            WorkflowEdgeSpec("a", None, "ok", "", True, (), "approved is true"),
+            edge("b", None, "done"),
+        ),
+    )
+    runner, events = make_runner(root, workflow)
+    stub_data_steps(runner, {"a": [{"approved": True, "issues": []}]})
+    await runner.execute()
+    errors = [p for t, p in events if t == "condition_error"]
+    assert errors and errors[0]["label"] == "bad"
+    assert "right-hand side" in errors[0]["error"]
+
+
+async def test_an_expression_edge_needs_no_worded_condition(root):
+    """An expression counts as describing the edge, so validation is satisfied."""
+    from app.services import graph
+
+    spec = expr_graph()
+    graph.validate(
+        [graph.NodeSpec(n.key, n.is_start, n.max_visits, n.artifact, n.output_schema)
+         for n in spec.nodes],
+        [graph.EdgeSpec(e.from_key, e.to_key, e.label, e.condition, e.is_default,
+                        e.resets, e.expression) for e in spec.edges],
+    )
+
+
+# ------------------------------------------------- selecting a node's inputs
+
+
+async def test_a_node_with_no_inputs_sees_everything(root):
+    workflow = WorkflowSpec(
+        id=1, name="all", max_steps=4,
+        nodes=(dataclasses.replace(node("a", is_start=True), output_key="first"),
+               node("b")),
+        edges=(edge("a", "b", "next"), edge("b", None, "done")),
+    )
+    runner, _ = make_runner(root, workflow)
+    stub_data_steps(runner, {})
+    await runner.execute()
+    assert "What the team has produced so far" in runner.last_prompt
+    assert "first" in runner.last_prompt
+
+
+async def test_a_node_can_select_one_field_of_an_earlier_result(root):
+    """The motivating case: a role reworking sees only the notes addressed to it."""
+    workflow = WorkflowSpec(
+        id=1, name="selected", max_steps=4,
+        nodes=(
+            dataclasses.replace(node("review", is_start=True), output_key="review_notes",
+                                output_schema=ISSUES_SCHEMA),
+            dataclasses.replace(
+                node("architect"),
+                inputs=(("review_notes", "issues", "my_notes"),),
+            ),
+        ),
+        edges=(edge("review", "architect", "next"), edge("architect", None, "done")),
+    )
+    runner, _ = make_runner(root, workflow)
+    stub_data_steps(runner, {
+        "review": [{"approved": False, "issues": ["architecture is too coupled"]}],
+    })
+    await runner.execute()
+
+    prompt = runner.last_prompt
+    assert "## Your inputs" in prompt
+    assert "### my_notes" in prompt
+    assert "architecture is too coupled" in prompt
+    # The rest of the review — its approved flag — was not handed over.
+    assert '"approved"' not in prompt
+
+
+def test_select_inputs_skips_what_has_not_been_produced_yet(root):
+    workflow = WorkflowSpec(
+        id=1, name="s", max_steps=2,
+        nodes=(dataclasses.replace(node("a", is_start=True),
+                                   inputs=(("later", "", "later"),)),),
+        edges=(),
+    )
+    runner, _ = make_runner(root, workflow)
+    assert workflow_runner.select_inputs(workflow.nodes[0], {}) == []
+
+
+def test_select_inputs_handles_a_missing_field_gracefully(root):
+    workflow = WorkflowSpec(
+        id=1, name="s", max_steps=2,
+        nodes=(dataclasses.replace(node("a", is_start=True),
+                                   inputs=(("src", "nope.deeper", "x"),)),),
+        edges=(),
+    )
+    runner, _ = make_runner(root, workflow)
+    step = StepResult("s", "r", 1, "prose", None, "src", {"present": 1})
+    assert workflow_runner.select_inputs(workflow.nodes[0], {"src": step}) == []
+
+
+def test_select_inputs_falls_back_to_prose_when_there_is_no_json(root):
+    workflow = WorkflowSpec(
+        id=1, name="s", max_steps=2,
+        nodes=(dataclasses.replace(node("a", is_start=True),
+                                   inputs=(("src", "field", "x"),)),),
+        edges=(),
+    )
+    runner, _ = make_runner(root, workflow)
+    step = StepResult("s", "r", 1, "just words", None, "src", None)
+    assert workflow_runner.select_inputs(workflow.nodes[0], {"src": step}) == [
+        ("x", "just words")
+    ]

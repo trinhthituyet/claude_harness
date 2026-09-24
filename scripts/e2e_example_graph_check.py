@@ -75,19 +75,56 @@ def graph_payload(role_ids: dict[str, int]) -> dict:
              "instructions": "State in two lines what the architect, designer and tester "
                              "should each produce. Write no files."},
             {"key": "architect", "role_id": role_ids["Architect"], "max_visits": 3,
-             "output_key": "arch_doc"},
+             "output_key": "arch_doc",
+             # Only the notes addressed to this role, not the whole review.
+             "inputs": [{"from": "brief"},
+                        {"from": "review_notes", "path": "architect_issues",
+                         "as": "my_review_notes"}]},
             {"key": "designer", "role_id": role_ids["Designer"], "max_visits": 3,
-             "output_key": "design_doc"},
+             "output_key": "design_doc",
+             "inputs": [{"from": "brief"},
+                        {"from": "review_notes", "path": "designer_issues",
+                         "as": "my_review_notes"}]},
             {"key": "tester", "role_id": role_ids["Tester"], "max_visits": 3,
-             "output_key": "test_cases"},
+             "output_key": "test_cases",
+             "inputs": [{"from": "brief"},
+                        {"from": "review_notes", "path": "tester_issues",
+                         "as": "my_review_notes"}]},
             {"key": "review", "role_id": role_ids["Manager"], "max_visits": 3,
              "output_key": "review_notes",
              "instructions": "Review the three artifacts for consistency with the goal. "
-                             "Say which role, if any, must change something."},
+                             "Say which role, if any, must change something.",
+             # The example graph's ReviewResult, as a per-node output schema.
+             "output_schema": {
+                 "type": "object",
+                 "properties": {
+                     "approved": {"type": "boolean"},
+                     "architect_issues": {"type": "array", "items": {"type": "string"}},
+                     "designer_issues": {"type": "array", "items": {"type": "string"}},
+                     "tester_issues": {"type": "array", "items": {"type": "string"}},
+                     "summary": {"type": "string"},
+                 },
+                 "required": ["approved", "summary"],
+                 "additionalProperties": False,
+             }},
             {"key": "engineer", "role_id": role_ids["Engineer"], "max_visits": 3,
              "output_key": "code"},
             {"key": "pm", "role_id": role_ids["ProjectManager"], "max_visits": 3,
-             "output_key": "pm_report"},
+             "output_key": "pm_report",
+             # The example graph's PMReport.
+             "output_schema": {
+                 "type": "object",
+                 "properties": {
+                     "code_ok": {"type": "boolean"},
+                     "failure_type": {
+                         "type": "string",
+                         "enum": ["none", "code_bug", "test_issue"],
+                     },
+                     "feedback": {"type": "string"},
+                 },
+                 "required": ["code_ok", "failure_type", "feedback"],
+                 "additionalProperties": False,
+             }},
             {"key": "human", "role_id": role_ids["Human"], "max_visits": 1},
         ],
         "edges": [
@@ -97,14 +134,15 @@ def graph_payload(role_ids: dict[str, int]) -> dict:
             {"from_key": "architect", "to_key": "review", "label": "report"},
             {"from_key": "designer", "to_key": "review", "label": "report"},
             {"from_key": "tester", "to_key": "review", "label": "report"},
+            # Routed by testing the review's own JSON — deterministic, no model call.
             {"from_key": "review", "to_key": "architect", "label": "arch_issues",
-             "condition": "the architecture note must change"},
+             "expression": "architect_issues is not empty"},
             {"from_key": "review", "to_key": "designer", "label": "design_issues",
-             "condition": "the design note must change"},
+             "expression": "designer_issues is not empty"},
             {"from_key": "review", "to_key": "tester", "label": "test_issues",
-             "condition": "the tests must change"},
+             "expression": "tester_issues is not empty"},
             {"from_key": "review", "to_key": "engineer", "label": "approved",
-             "condition": "all three artifacts are acceptable", "is_default": True},
+             "expression": "approved is true", "is_default": True},
             {"from_key": "engineer", "to_key": "pm", "label": "deliver"},
             {"from_key": "pm", "to_key": "engineer", "label": "code_bug",
              "condition": "the code itself is wrong"},
@@ -145,6 +183,18 @@ async def main() -> int:
                   all(e["condition"] == "" for e in graph["edges"]
                       if e["from_key"] == "dispatch"))
             check("the escalation node is recorded", graph["escalation_key"] == "human")
+            check("the review loop is routed by expression",
+                  all(e["expression"] for e in graph["edges"]
+                      if e["from_key"] == "review"),
+                  str([(e["label"], e["expression"]) for e in graph["edges"]
+                       if e["from_key"] == "review"]))
+            check("each role takes only its own review notes",
+                  all(any(i["path"].startswith(key) for i in
+                          next(n for n in graph["nodes"] if n["key"] == key)["inputs"]
+                          if i["from"] == "review_notes")
+                      for key in ("architect", "designer", "tester")),
+                  str(next(n for n in graph["nodes"]
+                           if n["key"] == "architect")["inputs"]))
             check("an upstream edge resets the review budget",
                   sorted(next(e for e in graph["edges"]
                               if e["label"] == "test_issue")["resets"]) == ["review", "tester"])
@@ -174,7 +224,11 @@ async def main() -> int:
             node_starts: list[str] = []
             edges_taken: list[dict] = []
             resets: list[dict] = []
+            evaluated: list[dict] = []
+            condition_errors: list[dict] = []
             artifacts: list[str] = []
+            structured: dict[str, list[str]] = {}
+            unsatisfied: list[dict] = []
             deadline = asyncio.get_event_loop().time() + 900
             while asyncio.get_event_loop().time() < deadline:
                 try:
@@ -186,8 +240,9 @@ async def main() -> int:
                 if kind == "_eof":
                     break
                 if kind in {"superstep", "node_started", "node_finished", "edge_taken",
-                            "visits_reset", "routing_failed", "workflow_stopped",
-                            "workflow_finished", "error", "status"}:
+                            "visits_reset", "routing_failed", "schema_unsatisfied",
+                            "conditions_evaluated", "condition_error",
+                            "workflow_stopped", "workflow_finished", "error", "status"}:
                     print(f"    [{kind}] {json.dumps(payload)[:170]}")
                 if kind == "superstep":
                     supersteps.append(payload["parallel"])
@@ -195,10 +250,18 @@ async def main() -> int:
                     node_starts.append(payload["node"])
                 if kind == "node_finished":
                     artifacts.append(payload.get("artifact", ""))
+                    if payload.get("structured"):
+                        structured[payload["node"]] = payload.get("fields") or []
                 if kind == "edge_taken":
                     edges_taken.append(payload)
                 if kind == "visits_reset":
                     resets.append(payload)
+                if kind == "schema_unsatisfied":
+                    unsatisfied.append(payload)
+                if kind == "conditions_evaluated":
+                    evaluated.append(payload)
+                if kind == "condition_error":
+                    condition_errors.append(payload)
                 if kind == "workflow_finished":
                     supersteps = supersteps or []
                 if kind == "status" and payload.get("state") in {
@@ -224,6 +287,25 @@ async def main() -> int:
             check("edges carry routing reasons",
                   any(e.get("why") for e in edges_taken),
                   str([e.get("why", "")[:60] for e in edges_taken[:3]]))
+            print("\n== structured outputs ==")
+            check("the review step returned structured JSON", "review" in structured,
+                  str(structured))
+            check("its fields are the ones the schema declared",
+                  "approved" in structured.get("review", []),
+                  str(structured.get("review")))
+            check("the project manager step returned structured JSON", "pm" in structured,
+                  str(structured))
+            check("no step silently ignored its schema", not unsatisfied, str(unsatisfied))
+
+            print("\n== deterministic routing ==")
+            check("the review's edges were decided by expression", bool(evaluated),
+                  str(evaluated[:2]))
+            check("no expression failed to parse or evaluate", not condition_errors,
+                  str(condition_errors))
+            if evaluated:
+                check("every review edge was tested, not guessed",
+                      len(evaluated[0]["results"]) == 4, str(evaluated[0]["results"]))
+
             check("named artifacts were produced",
                   {"arch_doc", "design_doc", "test_cases"} <= set(artifacts),
                   str(sorted(set(artifacts))))

@@ -331,14 +331,37 @@ class TaskOut(BaseModel):
 # ------------------------------------------------------------------- workflows
 
 
+class NodeInput(BaseModel):
+    """One earlier result to hand this step, optionally a field of it."""
+
+    #: The artifact name an earlier step wrote.
+    from_: str = Field(min_length=1, max_length=64, alias="from")
+    #: Dotted path into that artifact's JSON. Empty means the whole thing.
+    path: str = ""
+    #: What to call it in the prompt. Defaults to the source name.
+    as_: str = Field(default="", max_length=64, alias="as")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    @property
+    def label(self) -> str:
+        if self.as_:
+            return self.as_
+        return f"{self.from_}.{self.path}" if self.path else self.from_
+
+
 class WorkflowNodeIn(BaseModel):
     key: str = Field(min_length=1, max_length=64)
     role_id: int
     instructions: str = ""
+    #: Which earlier results to show this step. Empty means everything so far.
+    inputs: list[NodeInput] = Field(default_factory=list)
     is_start: bool = False
     max_visits: int = Field(default=3, ge=1, le=20)
     #: What this step's output is filed under for later steps. Defaults to the key.
     output_key: str | None = Field(default=None, max_length=64)
+    #: JSON Schema the step's result must match. None means free-form prose.
+    output_schema: dict[str, Any] | None = None
     #: Canvas position. Omitted means "lay it out automatically".
     pos_x: float | None = None
     pos_y: float | None = None
@@ -349,7 +372,10 @@ class WorkflowEdgeIn(BaseModel):
     #: None or "END" finishes the workflow.
     to_key: str | None = None
     label: str = Field(min_length=1, max_length=64)
+    #: Judged by a model.
     condition: str = ""
+    #: Evaluated by the harness against the source step's structured result.
+    expression: str = ""
     is_default: bool = False
     #: Node keys whose visit budget resets when this edge is taken.
     resets: list[str] = Field(default_factory=list)
@@ -369,13 +395,16 @@ class WorkflowIn(BaseModel):
 
         graph.validate(
             [
-                graph.NodeSpec(n.key, n.is_start, n.max_visits, n.output_key)
+                graph.NodeSpec(
+                    n.key, n.is_start, n.max_visits, n.output_key, n.output_schema,
+                    tuple((i.from_, i.path, i.label) for i in n.inputs),
+                )
                 for n in self.nodes
             ],
             [
                 graph.EdgeSpec(
                     e.from_key, e.to_key, e.label, e.condition, e.is_default,
-                    tuple(e.resets),
+                    tuple(e.resets), e.expression,
                 )
                 for e in self.edges
             ],
@@ -392,6 +421,8 @@ class WorkflowNodeOut(BaseModel):
     is_start: bool
     max_visits: int
     output_key: str
+    output_schema: dict[str, Any] | None
+    inputs: list[dict[str, str]]
     pos_x: float | None
     pos_y: float | None
 
@@ -414,6 +445,7 @@ class WorkflowEdgeOut(BaseModel):
     to_key: str | None
     label: str
     condition: str
+    expression: str
     is_default: bool
     resets: list[str]
 
@@ -446,6 +478,8 @@ class WorkflowOut(BaseModel):
                     is_start=node.is_start,
                     max_visits=node.max_visits,
                     output_key=node.output_key or node.key,
+                    output_schema=node.output_schema_json,
+                    inputs=list(node.inputs_json or []),
                     pos_x=node.pos_x,
                     pos_y=node.pos_y,
                 )
@@ -458,6 +492,7 @@ class WorkflowOut(BaseModel):
                     to_key=by_id[edge.to_node_id].key if edge.to_node_id in by_id else None,
                     label=edge.label,
                     condition=edge.condition,
+                    expression=edge.expression or "",
                     is_default=edge.is_default,
                     resets=list(edge.resets_json or []),
                 )

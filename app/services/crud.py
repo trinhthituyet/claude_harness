@@ -294,6 +294,10 @@ async def _write_graph(session: AsyncSession, workflow: Workflow, payload: Workf
             is_start=node.is_start or (not has_start and position == 0),
             max_visits=node.max_visits,
             output_key=node.output_key or node.key,
+            output_schema_json=node.output_schema,
+            inputs_json=[
+                {"from": i.from_, "path": i.path, "as": i.as_} for i in node.inputs
+            ],
             position=position,
             pos_x=node.pos_x,
             pos_y=node.pos_y,
@@ -312,6 +316,7 @@ async def _write_graph(session: AsyncSession, workflow: Workflow, payload: Workf
                 ),
                 label=edge.label,
                 condition=edge.condition,
+                expression=edge.expression,
                 is_default=edge.is_default,
                 resets_json=list(edge.resets),
                 position=position,
@@ -372,6 +377,8 @@ def summarise_workflow(row: Workflow) -> dict[str, Any]:
                 "instructions": node.instructions,
                 "max_visits": node.max_visits,
                 "output_key": node.output_key or node.key,
+                "output_schema": node.output_schema_json,
+                "inputs": list(node.inputs_json or []),
             }
             for node in row.nodes
         ],
@@ -381,6 +388,7 @@ def summarise_workflow(row: Workflow) -> dict[str, Any]:
                 "to": by_id[edge.to_node_id].key if edge.to_node_id in by_id else graph.END,
                 "label": edge.label,
                 "condition": edge.condition,
+                "expression": edge.expression or "",
                 "is_default": edge.is_default,
                 "resets": list(edge.resets_json or []),
             }

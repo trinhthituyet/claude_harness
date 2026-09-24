@@ -75,6 +75,12 @@ class WorkflowNode(Base):
     #: Name this step's output is filed under, so later steps can refer to it the way
     #: the example graph reads ``state["arch_doc"]``. Defaults to the node key.
     output_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: JSON Schema this step's result must match — the equivalent of the example graph's
+    #: ``with_structured_output(ReviewResult)``. NULL means free-form prose.
+    output_schema_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: Which earlier results this step is shown, as ``{"from", "path", "as"}`` entries.
+    #: Empty means "everything produced so far".
+    inputs_json: Mapped[list] = mapped_column(JSON, default=list)
     is_start: Mapped[bool] = mapped_column(Boolean, default=False)
     #: Loop budget: how many times this node may run in a single workflow run.
     max_visits: Mapped[int] = mapped_column(Integer, default=3)
@@ -109,8 +115,12 @@ class WorkflowEdge(Base):
     )
     #: Short name the router picks by, e.g. "needs_rework".
     label: Mapped[str] = mapped_column(String(64))
-    #: When this transition applies. Empty means unconditional.
+    #: When this transition applies, in words, judged by a model. Empty means
+    #: unconditional.
     condition: Mapped[str] = mapped_column(Text, default="")
+    #: A deterministic test over the source step's structured result, e.g.
+    #: ``issues contains architecture``. Evaluated by the harness — no model call.
+    expression: Mapped[str] = mapped_column(Text, default="")
     #: Taken when no condition matches. At most one per source node.
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
     #: Node keys whose visit budget is reset when this edge is taken. The example

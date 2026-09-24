@@ -26,6 +26,7 @@ from app.db import sessionmaker
 from app.models import McpServer, ModelConfig, Role, Skill, Task, Team, TeamRole, Workflow
 from app.schemas import (
     McpIn,
+    NodeInput,
     ModelIn,
     RoleIn,
     TaskIn,
@@ -425,15 +426,28 @@ async def list_workflows(session, args):
         ],
         "nodes": Annotated[
             list[dict],
-            "Each: {key, role_id, instructions, is_start, max_visits, output_key}. "
-            "Exactly one start. output_key names this step's result for later steps "
-            "(e.g. arch_doc, design_doc, code); it must be unique.",
+            "Each: {key, role_id, instructions, is_start, max_visits, output_key, "
+            "output_schema, inputs}. Exactly one start. output_key names this step's result for "
+            "later steps (e.g. arch_doc, design_doc, code) and must be unique. "
+            "output_schema is an optional JSON Schema ({type: object, properties: {...}}) "
+            "the step's result must match — use it when a later step or a branch needs to "
+            "read specific fields rather than prose, e.g. "
+            "{approved: boolean, issues: string[]}. inputs is an optional list of "
+            "{from, path, as} selecting which earlier results this step is shown — "
+            "e.g. {from: 'review_notes', path: 'issues', as: 'my_notes'} hands a role "
+            "just the notes addressed to it. Omit inputs to show everything.",
         ],
         "edges": Annotated[
             list[dict],
-            "Each: {from_key, to_key (null for END), label, condition, is_default, "
-            "resets}. resets lists node keys whose visit budget starts again when this "
-            "edge is taken — for sending work upstream with a fresh loop budget.",
+            "Each: {from_key, to_key (null for END), label, condition, expression, "
+            "is_default, resets}. Prefer `expression` over `condition` when the source "
+            "step has an output_schema: it is a deterministic test over that JSON, costs "
+            "nothing and always decides the same way. Syntax: `issues contains "
+            "architecture`, `approved is false`, `score > 5`, `notes is empty`, joined "
+            "with and/or/not; a dotted name reads another artifact "
+            "(`review_notes.approved`). Use `condition` (words, judged by a model) only "
+            "for genuinely judgemental branches. resets lists node keys whose visit "
+            "budget starts again when this edge is taken.",
         ],
     },
 )
@@ -456,6 +470,20 @@ async def create_workflow(session, args):
                     max_visits=int(n.get("max_visits") or 3),
                     output_key=(str(n["output_key"]).strip().lower()
                                 if n.get("output_key") else None),
+                    output_schema=(
+                        n["output_schema"]
+                        if isinstance(n.get("output_schema"), dict) and n["output_schema"]
+                        else None
+                    ),
+                    inputs=[
+                        NodeInput(**{
+                            "from": str(i.get("from", "")),
+                            "path": str(i.get("path", "")),
+                            "as": str(i.get("as", "")),
+                        })
+                        for i in (n.get("inputs") or [])
+                        if isinstance(i, dict) and i.get("from")
+                    ],
                 )
                 for n in args["nodes"]
             ],
@@ -469,6 +497,7 @@ async def create_workflow(session, args):
                     ),
                     label=str(e["label"]).strip().lower(),
                     condition=str(e.get("condition", "")),
+                    expression=str(e.get("expression", "")),
                     is_default=bool(e.get("is_default", False)),
                     resets=[str(r).strip().lower() for r in (e.get("resets") or [])],
                 )

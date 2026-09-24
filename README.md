@@ -89,9 +89,15 @@ shape, and ships as the "Software team" example):
   with **conditional** edges branches, decided by a tool-less query constrained to that
   node's own edge labels; it may select several, which is how only the roles with problems
   re-run. Mixing the two out of one node is rejected as ambiguous.
-- Each step files its result under a **named output** (`arch_doc`, `code`, …) and later
-  steps are handed those artifacts by name. The router can attach **feedback per target**,
-  so a role reworking sees the notes meant for it.
+- Each step files its result under a **named output** (`arch_doc`, `code`, …) and can
+  declare a **JSON Schema** for it, so downstream steps read fields rather than prose. A
+  step may also **select its inputs** — `{from: "review_notes", path: "architect_issues"}`
+  hands a role just the notes addressed to it.
+- An edge can carry an **expression** instead of a worded condition:
+  `issues contains architecture`, `approved is false`, `score > 5`, with `and`/`or`/`not`
+  and dotted paths. It is evaluated by the harness — deterministic, instant, no model call.
+  Expressions decide first; the model is only asked about edges described in words, and
+  only when no expression matched.
 - Loops are bounded twice — per-node visit budget and the workflow's superstep budget. A
   workflow can name an **escalation node** to hand over to when a budget runs out instead
   of failing, and an edge can **reset** visit budgets when it sends work back upstream.

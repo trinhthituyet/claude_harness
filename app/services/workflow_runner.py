@@ -12,6 +12,12 @@ what the shapes people actually draw require:
   apply. A branch may select several, which is how "only the flagged roles re-run" works.
 * Each step files its output under a **named artifact** (``arch_doc``, ``code``, …), so a
   later step can be handed exactly the documents it needs rather than a positional digest.
+* An edge may carry an **expression** — ``issues contains architecture`` — evaluated by
+  the harness against the source step's structured result. That is deterministic, instant
+  and free; the model is only asked about edges described in words, and only when no
+  expression already decided the matter.
+* A node may **select its inputs** (``review_notes.architect_issues``) instead of being
+  shown every artifact, which keeps a re-running role focused on what concerns it.
 * The router may attach **feedback per target**, so a role re-running after review sees
   the points addressed to it and not the others'.
 * Budgets are per-node visits plus a whole-run superstep cap. Exhausting either goes to
@@ -36,6 +42,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
 
 from app.security.gate import Gate
 from app.security.policy import RunPolicy
+from app.services import expr as expr_lang
 from app.services import messages, options_builder
 from app.services.events import EventBus
 from app.services.snapshot import RunSnapshot, WorkflowEdgeSpec, WorkflowNodeSpec, WorkflowSpec
@@ -60,6 +67,15 @@ class StepResult:
     output: str
     result: ResultMessage | None
     artifact: str = ""
+    #: The structured result, when the node declared an output schema.
+    data: dict[str, Any] | None = None
+
+    @property
+    def rendered(self) -> str:
+        """What later steps and the router are shown for this step."""
+        if self.data is not None:
+            return json.dumps(self.data, indent=2, default=str)
+        return self.output
 
 
 @dataclasses.dataclass
@@ -90,14 +106,65 @@ def _parse_json(text: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _artifact_block(artifacts: dict[str, StepResult]) -> str:
-    """The named outputs produced so far, the way the example graph's state reads."""
-    if not artifacts:
+def select_inputs(
+    node: WorkflowNodeSpec, artifacts: dict[str, StepResult]
+) -> list[tuple[str, str]]:
+    """The ``(label, text)`` pairs this step should be shown.
+
+    With no selection a step sees every artifact, which is the right default for a small
+    graph. Once a node declares inputs it sees only those — and a dotted path pulls one
+    field out of a structured result, so a role reworking gets just its own notes.
+    """
+    if not node.inputs:
+        return [
+            (f"{name}{' (JSON)' if step.data is not None else ''}", step.rendered)
+            for name, step in artifacts.items()
+        ]
+
+    chosen: list[tuple[str, str]] = []
+    for source, path, label in node.inputs:
+        step = artifacts.get(source)
+        if step is None:
+            # Not produced yet — normal on a first pass through a loop.
+            continue
+        if not path:
+            shape = " (JSON)" if step.data is not None else ""
+            chosen.append((f"{label}{shape}", step.rendered))
+            continue
+        if step.data is None:
+            chosen.append((label, step.rendered))
+            continue
+        value = expr_lang.resolve(_split_path(path), step.data)
+        if isinstance(value, expr_lang.Missing):
+            continue
+        chosen.append((
+            label,
+            value if isinstance(value, str) else json.dumps(value, indent=2, default=str),
+        ))
+    return chosen
+
+
+def _split_path(path: str) -> list:
+    parts: list = []
+    for segment in path.replace("[", ".").replace("]", "").split("."):
+        if not segment:
+            continue
+        parts.append(int(segment) if segment.lstrip("-").isdigit() else segment)
+    return parts
+
+
+def _artifact_block(node: WorkflowNodeSpec, artifacts: dict[str, StepResult]) -> str:
+    """The inputs this step is given, named."""
+    selected = select_inputs(node, artifacts)
+    if not selected:
         return ""
-    lines = ["", "## What the team has produced so far", ""]
-    for name, step in artifacts.items():
-        lines.append(f"### {name} — by {step.role} ({step.node_key})")
-        lines.append(step.output[-DIGEST_CHARS:] or "(no output)")
+    heading = (
+        "## Your inputs" if node.inputs else "## What the team has produced so far"
+    )
+    lines = ["", heading, ""]
+    for label, text in selected:
+        lines.append(f"### {label}")
+        lines.append(text[-DIGEST_CHARS:] or "(empty)")
         lines.append("")
     return "\n".join(lines)
 
@@ -121,13 +188,30 @@ def _step_prompt(
             "",
             *(f"- {item}" for item in feedback),
         ]
-    block = _artifact_block(artifacts)
+    block = _artifact_block(node, artifacts)
     if block:
         parts.append(block)
+    if node.output_schema is not None:
+        parts += [
+            "",
+            "## Your result must match this shape",
+            "",
+            "Do the work first, then report it as a structured result matching this "
+            "JSON Schema. The fields are what the rest of the team will read:",
+            "",
+            "```json",
+            json.dumps(node.output_schema, indent=2),
+            "```",
+        ]
     parts += [
         "",
         f"Do your part of this goal now. Your output is filed as `{node.artifact}` for "
-        "the rest of the team. Finish by stating what you produced.",
+        "the rest of the team."
+        + (
+            " Finish with the structured result."
+            if node.output_schema is not None
+            else " Finish by stating what you produced."
+        ),
     ]
     return "\n".join(parts)
 
@@ -153,6 +237,8 @@ class WorkflowRunner:
         self.bus = bus
         self._stderr_sink = stderr_sink
         self.cancelled = False
+        #: Structured artifacts by name, for expressions to read across steps.
+        self._artifact_data: dict[str, Any] = {}
         self._clients: dict[str, ClaudeSDKClient] = {}
         self._semaphore = asyncio.Semaphore(MAX_PARALLEL_STEPS)
 
@@ -192,6 +278,13 @@ class WorkflowRunner:
     ) -> StepResult:
         async with self._semaphore:
             options, _ = self._options_for(node)
+            if node.output_schema is not None:
+                # The gate's hook stays on: structured output arrives through a
+                # StructuredOutput tool call, which the guard recognises as harmless.
+                options = dataclasses.replace(
+                    options,
+                    output_format={"type": "json_schema", "schema": node.output_schema},
+                )
             prompt = _step_prompt(self.snapshot, node, artifacts, feedback)
             output: list[str] = []
             result: ResultMessage | None = None
@@ -220,13 +313,45 @@ class WorkflowRunner:
                 self._clients.pop(node.key, None)
 
             text = "\n\n".join(output).strip()
+            data: dict[str, Any] | None = None
+            if node.output_schema is not None:
+                data = self._structured(result, text)
+                if data is None:
+                    # The node was held to a shape and did not produce it. Keep the prose
+                    # so the run is still useful, but say so — a silently unstructured
+                    # artifact would break whatever reads its fields.
+                    await self.bus.emit(
+                        "schema_unsatisfied",
+                        {"node": node.key, "artifact": node.artifact,
+                         "note": "no result matching the declared schema; kept the prose "
+                                 "output instead"},
+                    )
+                    log.warning(
+                        "workflow %s: node %s did not satisfy its output schema",
+                        self.workflow.name, node.key,
+                    )
+
             await self.bus.emit(
                 "node_finished",
                 {"node": node.key, "role": node.role.name, "visit": visit,
                  "artifact": node.artifact, "chars": len(text),
+                 "structured": data is not None,
+                 "fields": sorted(data) if data else None,
                  "cost_usd": result.total_cost_usd if result else None},
             )
-            return StepResult(node.key, node.role.name, visit, text, result, node.artifact)
+            return StepResult(node.key, node.role.name, visit, text, result,
+                              node.artifact, data)
+
+    @staticmethod
+    def _structured(result: ResultMessage | None, text: str) -> dict[str, Any] | None:
+        """The structured result, falling back to JSON embedded in the prose."""
+        if result is not None and isinstance(result.structured_output, dict):
+            return result.structured_output
+        for candidate in ((result.result if result else None), text):
+            parsed = _parse_json(candidate)
+            if parsed is not None:
+                return parsed
+        return None
 
     # --------------------------------------------------------------- routing
 
@@ -250,23 +375,43 @@ class WorkflowRunner:
             return [(edges[0], "")], ""
 
         default = next((edge for edge in edges if edge.is_default), None)
+
+        # Expressions are deterministic, so they decide before anything is asked of a
+        # model. If any matched, that is the answer — no call, no judgement, no cost.
+        matched, tested = await self._evaluate_expressions(node, edges, step)
+        if matched:
+            return matched, "matched " + ", ".join(
+                f"{edge.label} ({edge.expression})" for edge, _ in matched
+            )
+
+        worded = [edge for edge in edges if edge.condition.strip()]
+        if not worded:
+            # Every edge was an expression and none matched: fall to the default rather
+            # than asking a model about conditions nobody wrote in words.
+            if default is not None:
+                return [(default, "")], (
+                    f"no expression matched ({tested}); took the default {default.label!r}"
+                )
+            await self.bus.emit(
+                "routing_failed",
+                {"node": node.key, "detail": f"no expression matched ({tested})",
+                 "fallback": None},
+            )
+            return [], f"no expression matched ({tested}) and there is no default"
+
+        edges = worded + ([default] if default is not None and default not in worded else [])
         labels = [edge.label for edge in edges]
 
         options, _ = self._options_for(node)
-        # A routing decision must not touch anything: no tools, and an answer
-        # constrained to this node's own edge labels.
-        #
-        # ``hooks=None`` is measured, not stylistic: with a PreToolUse hook registered
-        # the CLI returns an empty structured result, and routing silently falls back.
-        # Dropping it costs nothing because this session has no tools for the hook to
-        # fire on. ``can_use_tool`` stays — removing that instead produced
-        # error_max_structured_output_retries.
+        # A routing decision must not touch anything: no tools, and an answer constrained
+        # to this node's own edge labels. The gate's hook stays registered — structured
+        # output arrives through a ``StructuredOutput`` tool call, which the guard now
+        # recognises as having no filesystem effect, so there is no reason to drop it.
         router_options = dataclasses.replace(
             options,
             tools=[],
             mcp_servers={},
             agents=None,
-            hooks=None,
             max_turns=4,
             system_prompt=(
                 "You route a workflow. Read the step's output and choose every edge that "
@@ -308,7 +453,7 @@ class WorkflowRunner:
         )
         prompt = (
             f"The step '{node.key}' (role: {step.role}) produced this output:\n\n"
-            f"{step.output[-DIGEST_CHARS:] or '(no output)'}\n\n"
+            f"{step.rendered[-DIGEST_CHARS:] or '(no output)'}\n\n"
             f"Available edges:\n{described}\n\nWhich edges apply?"
         )
 
@@ -351,6 +496,54 @@ class WorkflowRunner:
                 chosen = [(default, f"no usable routing decision ({raw})")]
                 why = f"routing produced nothing usable ({raw}); took the default"
         return chosen, why
+
+    async def _evaluate_expressions(
+        self, node: WorkflowNodeSpec, edges: list[WorkflowEdgeSpec], step: StepResult
+    ) -> tuple[list[tuple[WorkflowEdgeSpec, str]], str]:
+        """Test every edge that carries an expression against this step's result.
+
+        The context is the step's own structured fields, plus each artifact by name — so
+        ``issues contains architecture`` reads this step, and
+        ``review_notes.approved`` reads another's.
+        """
+        with_expressions = [e for e in edges if e.expression.strip()]
+        if not with_expressions:
+            return [], "no expressions"
+
+        context: dict[str, Any] = dict(self._artifact_data)
+        if step.data:
+            # This step's own fields take precedence, so the common case is unqualified.
+            context.update(step.data)
+        context.setdefault("output", step.output)
+
+        matched: list[tuple[WorkflowEdgeSpec, str]] = []
+        tested: list[str] = []
+        for edge in with_expressions:
+            try:
+                result = expr_lang.evaluate(edge.expression, context)
+            except expr_lang.ExprError as exc:
+                # A broken expression must not silently never fire.
+                await self.bus.emit(
+                    "condition_error",
+                    {"node": node.key, "label": edge.label,
+                     "expression": edge.expression, "error": str(exc)},
+                )
+                log.warning(
+                    "workflow %s: edge %s expression failed: %s",
+                    self.workflow.name, edge.label, exc,
+                )
+                tested.append(f"{edge.label}=error")
+                continue
+            tested.append(f"{edge.label}={'true' if result else 'false'}")
+            if result:
+                matched.append((edge, ""))
+
+        await self.bus.emit(
+            "conditions_evaluated",
+            {"node": node.key, "results": tested,
+             "matched": [edge.label for edge, _ in matched]},
+        )
+        return matched, ", ".join(tested)
 
     # ------------------------------------------------------------------- walk
 
@@ -419,6 +612,8 @@ class WorkflowRunner:
             for step in results:
                 steps.append(step)
                 artifacts[step.artifact] = step
+                if step.data is not None:
+                    self._artifact_data[step.artifact] = step.data
 
             if self.cancelled:
                 reason = "cancelled"

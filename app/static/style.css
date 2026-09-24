@@ -296,3 +296,6 @@ svg.graph .g-artifact { font-size: 9px; fill: var(--ok); font-family: var(--mono
 .ev.superstep .k, .ev.superstep { color: var(--ok); }
 .ev.visits_reset .k { color: var(--warn); }
 .ev.routing_failed .k, .ev.routing_failed { color: var(--danger); }
+.inspector details.editor { margin-bottom: 0; }
+.inspector details.editor textarea { min-height: 170px; }
+svg.graph .g-cond { white-space: pre; }
