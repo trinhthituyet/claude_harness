@@ -74,6 +74,24 @@ export function siblingsOf(edges, edge) {
   return edges.filter((e) => e.from_key === edge.from_key);
 }
 
+/**
+ * The edge index for whatever a pointer landed on, or null.
+ *
+ * Needed because a label is a group: a hit rect carrying the index, with text drawn on
+ * top. Reading ``dataset.edge`` off the event target alone misses every click that lands
+ * on the text or one of its tspans — which is most of them.
+ */
+export function edgeIndexFromTarget(target) {
+  let element = target;
+  while (element) {
+    const value = element.dataset?.edge;
+    if (value !== undefined) return Number(value);
+    element = element.parentElement || element.parentNode;
+    if (element && element.nodeType !== 1) return null;
+  }
+  return null;
+}
+
 /** Several bare edges out of one node: every arm runs, in parallel. */
 export function fansOut(edges, fromKey) {
   const out = edges.filter((e) => e.from_key === fromKey);
@@ -172,11 +190,19 @@ function drawEdgeLabel(edge, geo,
   const width = widest * 5.9 + 10;
   const height = 13 + rendered.length * 11;
   if (index !== null) {
-    group.append(svgEl("rect", {
+    const hit = svgEl("rect", {
       x: geo.lx - width / 2, y: geo.ly - 11, width, height, rx: 4,
       fill: "var(--bg)", "fill-opacity": 0.72, stroke: "none",
       class: "g-labelhit", "data-edge": index,
-    }));
+    });
+    if (edge.condition || edge.expression) {
+      const title = svgEl("title");
+      title.textContent = edge.expression
+        ? `${edge.expression}  (evaluated by the harness)`
+        : edge.condition;
+      hit.append(title);
+    }
+    group.append(hit);
   }
 
   const text = svgEl("text", {
@@ -189,13 +215,6 @@ function drawEdgeLabel(edge, geo,
       x: geo.lx, dy: 11,
       class: missing && i === rendered.length - 1 ? "g-cond missing" : "g-cond",
     }, missing && i === rendered.length - 1 ? line : `"${line}"`));
-  }
-  if (edge.condition || edge.expression) {
-    const title = svgEl("title");
-    title.textContent = edge.expression
-      ? `${edge.expression}  (evaluated by the harness)`
-      : edge.condition;
-    text.append(title);
   }
   group.append(text);
   return group;
@@ -429,9 +448,9 @@ export function interactiveCanvas(model) {
       return;
     }
 
-    const edgeIndex = event.target.dataset?.edge;
-    if (edgeIndex !== undefined) {
-      model.onSelect?.({ kind: "edge", index: Number(edgeIndex) });
+    const edgeIndex = edgeIndexFromTarget(event.target);
+    if (edgeIndex !== null) {
+      model.onSelect?.({ kind: "edge", index: edgeIndex });
       return;
     }
 

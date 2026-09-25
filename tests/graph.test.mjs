@@ -6,8 +6,8 @@
 // placed them, how a condition is wrapped for drawing, and which edges the canvas must
 // flag as undecidable. The pointer interactions need a real browser and are not here.
 
-import { conditionLines, fansOut, needsCondition, parseSchemaText, positionsOf,
-  siblingsOf, BOX_W } from "../app/static/views/graph.js";
+import { conditionLines, edgeIndexFromTarget, fansOut, needsCondition, parseSchemaText,
+  positionsOf, siblingsOf, BOX_W } from "../app/static/views/graph.js";
 
 let failures = 0;
 const results = [];
@@ -197,6 +197,31 @@ const exprPlusBare = [
 check("a bare edge beside an expression is still flagged",
   needsCondition(exprPlusBare, exprPlusBare[1]) === true);
 check("and that node is not a fan-out", fansOut(exprPlusBare, "a") === false);
+
+// ------------------------------------------------------- clicking an edge label
+
+group("edge hit detection");
+
+// A label is a group: a hit rect carrying the index, with text drawn over it. Clicks
+// land on whichever element is topmost, so the lookup has to walk up to the index.
+const ELEMENT = 1;
+const rect = { nodeType: ELEMENT, dataset: { edge: "3" }, parentNode: null };
+const text = { nodeType: ELEMENT, dataset: {}, parentNode: rect };
+const tspan = { nodeType: ELEMENT, dataset: {}, parentNode: text };
+
+check("a click straight on the hit rect resolves", edgeIndexFromTarget(rect) === 3);
+check("a click on the label text resolves", edgeIndexFromTarget(text) === 3);
+check("a click on a tspan inside the text resolves", edgeIndexFromTarget(tspan) === 3);
+check("edge 0 is found, not treated as absent", edgeIndexFromTarget(
+  { nodeType: ELEMENT, dataset: { edge: "0" }, parentNode: null }) === 0);
+
+const elsewhere = { nodeType: ELEMENT, dataset: {}, parentNode: null };
+check("something unrelated resolves to nothing", edgeIndexFromTarget(elsewhere) === null);
+check("a null target is handled", edgeIndexFromTarget(null) === null);
+
+// Walking must stop at the document, not crawl past it.
+const svgRoot = { nodeType: ELEMENT, dataset: {}, parentNode: { nodeType: 9 } };
+check("the walk stops at a non-element parent", edgeIndexFromTarget(svgRoot) === null);
 
 // ----------------------------------------------------------------- reporting
 

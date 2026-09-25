@@ -493,8 +493,11 @@ function editor(editing, roles, examples, panel) {
     }, state.nodes.map((n) =>
       el("option", { value: n.key, selected: (edge.resets || []).includes(n.key) }, n.key)));
     const parallel = fansOut(state.edges, edge.from_key);
-
     const loops = edge.to_key && state.nodes.some((n) => n.key === edge.to_key);
+    // Updated in place rather than by rebuilding the inspector, which would move focus
+    // out of whatever field is being edited.
+    const heading = el("strong", {}, `Edge: ${edge.from_key} → ${edge.to_key || END}`);
+    const testSummary = el("span", {}, "");
 
     function apply() {
       const nextLabel = labelInput.value.trim().toLowerCase().replace(/\s+/g, "_");
@@ -510,6 +513,7 @@ function editor(editing, roles, examples, panel) {
       edge.condition = condition.value;
       edge.expression = expression.value.trim();
       edge.resets = [...resetsSelect.selectedOptions].map((o) => o.value);
+      heading.textContent = `Edge: ${edge.from_key} → ${edge.to_key || END}`;
       describeExpression();
       if (isDefault.input.checked) {
         for (const other of state.edges) {
@@ -536,6 +540,9 @@ function editor(editing, roles, examples, panel) {
 
     function describeExpression() {
       const text = expression.value.trim();
+      testSummary.textContent = text
+        ? `Test: ${text}`
+        : "Test the result instead (no model call)";
       if (!text) {
         expressionState.className = "path-state";
         expressionState.textContent = ownFields.length
@@ -551,12 +558,17 @@ function editor(editing, roles, examples, panel) {
         ? `Reads: ${ownFields.join(", ")}${artifacts.length ? ` · also ${artifacts.join(", ")}` : ""}`
         : "No declared fields on the source step — this will not match anything.";
     }
-    expression.addEventListener("input", describeExpression);
+    let expressionTimer = null;
+    expression.addEventListener("input", () => {
+      describeExpression();
+      clearTimeout(expressionTimer);
+      expressionTimer = setTimeout(apply, 350);
+    });
     describeExpression();
 
     return el("div", {},
       el("div", { class: "card-head" },
-        el("strong", {}, `Edge: ${edge.from_key} → ${edge.to_key || END}`),
+        heading,
         parallel ? el("span", { class: "tag ok" }, "parallel arm")
           : siblings.length > 1 ? el("span", { class: "tag warn" }, "branch") : null,
         loops && state.nodes.findIndex((n) => n.key === edge.to_key)
@@ -580,8 +592,7 @@ function editor(editing, roles, examples, panel) {
               + "the default, which is taken when no condition matches."
             : "Optional while this is the only way out of " + edge.from_key + "."),
       el("details", { class: "editor", open: !!edge.expression },
-        el("summary", {},
-          edge.expression ? `Test: ${edge.expression}` : "Test the result instead (no model call)"),
+        el("summary", {}, testSummary),
         el("p", { class: "sub" },
           "A deterministic test over the source step's JSON result — e.g. "
           + "\u201cissues contains architecture\u201d, \u201capproved is false\u201d, "

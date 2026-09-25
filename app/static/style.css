@@ -264,8 +264,9 @@ svg.graph .g-handle {
   cursor: crosshair;
 }
 svg.graph .g-handle:hover { fill: var(--accent); stroke: var(--accent); }
-svg.graph .g-label.hit { cursor: pointer; }
-svg.graph .g-label.hit:hover { fill: var(--text); }
+/* The label text sits above its hit rect; without this, clicking a label lands on the
+   text (which carries no index) and deselects instead of selecting the edge. */
+svg.graph .g-label, svg.graph .g-cond { pointer-events: none; }
 svg.graph .g-label.selected { fill: var(--accent); font-weight: 600; }
 svg.graph .g-endzone { pointer-events: none; }
 
